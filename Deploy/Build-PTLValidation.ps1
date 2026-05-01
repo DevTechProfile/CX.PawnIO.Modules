@@ -93,7 +93,7 @@ try {
             $o = [uint64[]]::new(7); $r = [UIntPtr]::Zero
             $lhr = [PIO]::Exec($h, 'ioctl_read_imc_clock_live', $inBuf, [UIntPtr]::Zero, $o, [UIntPtr]::new([uint64]7), [ref]$r)
             $samples += [PSCustomObject]@{
-                Time = (Get-Date -Format 'HH:mm:ss.fff'); HResult=[uint32]$lhr; Ratio=[int]$o[2]; Raw=[uint32]$o[5]; Flags=[int]$o[6]
+                Time = (Get-Date -Format 'HH:mm:ss.fff'); HResult=[uint32]$lhr; Ratio=[int]$o[2]; Gear=[int]$o[4]; Raw=[uint32]$o[5]; Flags=[int]$o[6]
             }
             Start-Sleep -Milliseconds $delayMs
         }
@@ -147,7 +147,7 @@ function Decode-Live($s, $bclk = 100.0) {
     $ioMHz = $s.Ratio * $bclk / 3.0 * 2.0
     $mtps  = $ioMHz * 2.0
     return [PSCustomObject]@{
-        Time = $s.Time; Raw = (Hex32 $s.Raw); Ratio = $s.Ratio
+        Time = $s.Time; Raw = (Hex32 $s.Raw); Ratio = $s.Ratio; Gear = $s.Gear
         IO_MHz = [int][Math]::Round($ioMHz); MT_s = [int][Math]::Round($mtps)
     }
 }
@@ -233,40 +233,56 @@ foreach ($s in $static) {
     $idx++
 }
 $lines.Add('')
-$lines.Add(('Decoded sample 1: ratio={0} × ref={1:N3} MHz × 2 = **IO clock {2:N0} MHz** (= {3:N0} MT/s).' -f
+$lines.Add(('Decoded sample 1: ratio={0} x ref={1:N3} MHz x 2 = **IO clock {2:N0} MHz** (= {3:N0} MT/s).' -f
     $s0.Ratio, $s0_refMHz, $s0_io, $s0_mtps))
 $lines.Add('')
 
 $lines.Add('## Live IOCTL -- `ioctl_read_imc_clock_live` (workpoint)')
-$lines.Add(('Reference clock: BCLK/3 = 33.333 MHz (BCLK assumed 100 MHz). IO clock = ratio × BCLK/3 × 2.'))
+$lines.Add(('Reference clock: BCLK/3 = 33.333 MHz (BCLK assumed 100 MHz). IO clock = ratio x BCLK/3 x 2.'))
 $lines.Add('')
 $lines.Add('### Idle')
 $lines.Add(('Distinct ratios observed: {0}' -f $liveIdleRatios))
 $lines.Add('')
-$lines.Add('| Time | Raw | Ratio | IO clock (MHz) | Data rate (MT/s) |')
-$lines.Add('|---|---|---|---|---|')
-foreach ($s in $liveIdleDec) { $lines.Add(('| {0} | {1} | {2} | {3:N0} | {4:N0} |' -f $s.Time, $s.Raw, $s.Ratio, $s.IO_MHz, $s.MT_s)) }
+$lines.Add('| Time | Raw | Ratio | Gear | IO clock (MHz) | Data rate (MT/s) |')
+$lines.Add('|---|---|---|---|---|---|')
+foreach ($s in $liveIdleDec) { $lines.Add(('| {0} | {1} | {2} | {3} | {4:N0} | {5:N0} |' -f $s.Time, $s.Raw, $s.Ratio, $gearName[$s.Gear], $s.IO_MHz, $s.MT_s)) }
 $lines.Add('')
-$lines.Add('### Under memory stress (8 × 256 MiB random fill in a tight loop)')
+$lines.Add('### Under memory stress (8 x 256 MiB random fill in a tight loop)')
 $lines.Add(('Distinct ratios observed: {0}' -f $liveStressRatios))
 $lines.Add('')
-$lines.Add('| Time | Raw | Ratio | IO clock (MHz) | Data rate (MT/s) |')
-$lines.Add('|---|---|---|---|---|')
-foreach ($s in $liveStressDec) { $lines.Add(('| {0} | {1} | {2} | {3:N0} | {4:N0} |' -f $s.Time, $s.Raw, $s.Ratio, $s.IO_MHz, $s.MT_s)) }
+$lines.Add('| Time | Raw | Ratio | Gear | IO clock (MHz) | Data rate (MT/s) |')
+$lines.Add('|---|---|---|---|---|---|')
+foreach ($s in $liveStressDec) { $lines.Add(('| {0} | {1} | {2} | {3} | {4:N0} | {5:N0} |' -f $s.Time, $s.Raw, $s.Ratio, $gearName[$s.Gear], $s.IO_MHz, $s.MT_s)) }
 $lines.Add('')
 
-$lines.Add('## Cross-validation against external references')
-$lines.Add('')
-$lines.Add('| Source | Reported max DRAM | Reported live (idle) | Reported live (stress) |')
-$lines.Add('|---|---|---|---|')
-$lines.Add(('| Module static IOCTL | {0:N0} MHz IO ({1:N0} MT/s) | -- | -- |' -f $s0_io, $s0_mtps))
-$lines.Add('| Module live IOCTL   | -- | _see table above_ | _see table above_ |')
-$lines.Add('| HWiNFO Memory Clock | _fill in_ | _fill in_ | _fill in_ |')
-$lines.Add('| Win32_PhysicalMemory.ConfiguredClockSpeed | _see DRAM table above_ | n/a | n/a |')
-$lines.Add('')
-$lines.Add('Reviewer: confirm the module-static IO clock equals the SMBIOS configured speed,')
-$lines.Add('and that the live ratios bracket the HWiNFO reading at idle and at full load.')
-$lines.Add('')
+# Cross-validation section is hand-curated (HWiNFO numbers come from a
+# screenshot, not from anything we can scrape here). On re-run we lift the
+# existing section out of the prior VALIDATION-PTL.md and replay it
+# verbatim, so contributors don't lose their HWiNFO numbers when they
+# regenerate the data sections above. First run uses placeholders.
+$preservedXval = $null
+if (Test-Path $OutPath) {
+    $prior = Get-Content $OutPath -Raw -Encoding UTF8
+    $m = [regex]::Match($prior, '(?ms)^## Cross-validation against external references.*?(?=^## Reproducibility)')
+    if ($m.Success) { $preservedXval = $m.Value.TrimEnd() }
+}
+if ($preservedXval) {
+    foreach ($l in ($preservedXval -split "`r?`n")) { $lines.Add($l) }
+    $lines.Add('')
+} else {
+    $lines.Add('## Cross-validation against external references')
+    $lines.Add('')
+    $lines.Add('| Source | Reported max DRAM | Reported live (idle) | Reported live (stress) |')
+    $lines.Add('|---|---|---|---|')
+    $lines.Add(('| Module static IOCTL | {0:N0} MHz IO ({1:N0} MT/s) | -- | -- |' -f $s0_io, $s0_mtps))
+    $lines.Add('| Module live IOCTL   | -- | _see table above_ | _see table above_ |')
+    $lines.Add('| HWiNFO Memory Clock | _fill in_ | _fill in_ | _fill in_ |')
+    $lines.Add('| Win32_PhysicalMemory.ConfiguredClockSpeed | _see DRAM table above_ | n/a | n/a |')
+    $lines.Add('')
+    $lines.Add('Reviewer: confirm the module-static IO clock equals the SMBIOS configured speed,')
+    $lines.Add('and that the live ratios bracket the HWiNFO reading at idle and at full load.')
+    $lines.Add('')
+}
 
 $lines.Add('## Reproducibility')
 $lines.Add('')

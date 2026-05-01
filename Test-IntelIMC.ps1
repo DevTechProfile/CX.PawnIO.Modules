@@ -224,10 +224,13 @@ try {
         '  HRESULT      : {0}  (live IOCTL not applicable here)' -f (Format-HResult $liveHr)
     } else {
         $liveRatio = [int]$liveOut[2]
+        $liveGear  = [int]$liveOut[4]
         $liveRaw   = [uint32]$liveOut[5]
         $liveIoMHz = $liveRatio * $BclkMHz / 3.0 * 2.0
+        $liveGearName = @{0='UNKNOWN'; 1='Gear1'; 2='Gear2'; 4='Gear4'}[$liveGear]
         '  Raw SA_PERF  : 0x{0:X8}' -f $liveRaw
         '  Live ratio   : {0}' -f $liveRatio
+        '  Gear         : {0} ({1})' -f $liveGear, $liveGearName
         '  Live IO clock: {0:N0} MHz' -f $liveIoMHz
         '  Live data    : {0:N0} MT/s' -f ($liveIoMHz * 2.0)
     }
