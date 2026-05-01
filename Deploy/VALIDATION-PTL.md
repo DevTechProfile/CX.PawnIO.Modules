@@ -111,15 +111,21 @@ Distinct ratios observed: 18, 36, 64
 
 ## Cross-validation against external references
 
-| Source | Reported max DRAM | Reported live (idle) | Reported live (stress) |
-|---|---|---|---|
-| Module static IOCTL | 4,267 MHz IO (8,533 MT/s) | -- | -- |
-| Module live IOCTL   | -- | _see table above_ | _see table above_ |
-| HWiNFO Memory Clock | _fill in_ | _fill in_ | _fill in_ |
-| Win32_PhysicalMemory.ConfiguredClockSpeed | _see DRAM table above_ | n/a | n/a |
+External cross-check via HWiNFO64 v8.44 -- see [`screenshots/PTL_hwinfo_memory_clocks.png`](../screenshots/PTL_hwinfo_memory_clocks.png) for the captured Sensors view.
 
-Reviewer: confirm the module-static IO clock equals the SMBIOS configured speed,
-and that the live ratios bracket the HWiNFO reading at idle and at full load.
+| Source | Max DRAM | Min observed | Snapshot under load |
+|---|---|---|---|
+| Module static IOCTL                       | 4,267 MHz IO (8,533 MT/s) | -- | -- |
+| Module live IOCTL                         | 4,267 MHz (ratio 64) | 1,200 MHz (ratio 18) | 3,200 MHz (ratio 48), see live-stress table |
+| HWiNFO64 Memory Clock                     | 4,266.7 MHz | 1,200.0 MHz | 3,200.0 MHz (Current at capture) |
+| HWiNFO64 Gear Mode                        | 4 | 4 | 4 (matches module's `Gear4` decode) |
+| Win32_PhysicalMemory.ConfiguredClockSpeed | 8,533 MT/s (= 4,267 MHz IO) | n/a | n/a |
+
+Three independent references (the module's own MEMSS_PMA decode, HWiNFO64's
+Memory Clock sensor, and the SMBIOS DRAM module data the firmware
+populates) all report the same locked-max value. The HWiNFO live range
+(1,200 -- 4,266.7 MHz) brackets exactly the live-IOCTL ratios captured
+under stress (18 -- 64, decoding to 1,200 -- 4,267 MHz), and gear matches.
 
 ## Reproducibility
 
