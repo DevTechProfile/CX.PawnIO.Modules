@@ -1,3 +1,5 @@
 *.amx
 *.bin
 .vs/
+Deploy/bundle/
+my.key
