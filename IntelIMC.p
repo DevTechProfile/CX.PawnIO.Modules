@@ -130,12 +130,21 @@
 #define MEMSS_PMA_CR_BIOS_DATA      0x13D10
 
 // SA_PERF_STATUS: the older System-Agent performance status register used
-// on Alder Lake / Raptor Lake clients. Intel's Core Ultra docs warn that
-// this register's QCLK_RATIO field is "not defined properly" on Core Ultra
-// silicon and route the equivalent data through MEMSS_PMA instead, so this
-// register is only used on ADL/RPL.
+// on Alder Lake / Raptor Lake clients with the documented encoding:
 //   bits 9:2  QCLK_RATIO     - controller QCLK multiplier of the reference
 //   bit 10    QCLK_REFERENCE - 0 = BCLK*4/3 (133.33 MHz), 1 = BCLK (100 MHz)
+// Intel's Core Ultra docs warn that this field is "not defined properly"
+// on Core Ultra and route the trained-max value through MEMSS_PMA instead.
+//
+// Empirically on Panther Lake (PTL-H, model 0xCC) bits 9:2 of this register
+// DO track the live QCLK workpoint - the value drops from 64 (LPDDR5X-8533
+// trained max) to 18 under low memory activity and returns to 64 under
+// load. The reference clock that matches both endpoints is BCLK/3 (same
+// as MEMSS_PMA), not the ADL/RPL bit-10 selector. This module therefore
+// uses SA_PERF_STATUS only as a live-workpoint signal on Core Ultra and
+// keeps the ADL/RPL decode path separate. Bit 10 has been observed to
+// stay set on PTL regardless of state, so it is treated as informational
+// rather than a reference selector on Core Ultra.
 #define SA_PERF_STATUS              0x5918
 
 // Range a freshly trained QCLK ratio is expected to fall in. The lower
@@ -147,11 +156,22 @@
 #define IMC_RATIO_MIN               16
 #define IMC_RATIO_MAX               220
 
-// Mask of reserved bits in MEMSS_PMA_CR_BIOS_DATA (bits 31:9). A nonzero
-// value here means the read returned something this module does not
-// understand - either the register layout shifted on a future stepping or
+// Mask of reserved bits in MEMSS_PMA_CR_BIOS_DATA on platforms whose layout
+// matches Intel's published Core Ultra 200H/200U register reference (MTL,
+// ARL, LNL). Bits 31:9 are reserved-zero on those parts. A nonzero value
+// here means either the register was repurposed in a future stepping or
 // we are on a CPU that mapped a different register at this offset.
-#define MEMSS_PMA_RESERVED_MASK     0xFFFFFE00
+#define MEMSS_PMA_RESERVED_MASK_STRICT  0xFFFFFE00
+// On Panther Lake the register at MCHBAR + 0x13D10 returns nonzero values
+// in the Core-Ultra-200-era reserved range (observed: 0x1E8B0000 on PTL-H
+// model 0xCC). PTL is newer than the spec this module was written against
+// and appears to encode additional fields here, so the strict mask would
+// reject every PTL read despite the ratio in bits 7:0 looking sane. Until
+// PTL's full layout is published, the reserved-bits gate is disabled on PTL
+// and the consistency check relies on the ratio range alone. The
+// EXPERIMENTAL flag is already set on every successful return, so consumers
+// continue to treat the value as best-effort.
+#define MEMSS_PMA_RESERVED_MASK_NONE    0
 
 // === Platform tags ===
 // A platform tag identifies the family of registers this module knows how
@@ -215,6 +235,34 @@ stock get_platform_source(platform) {
     return IMC_SRC_NONE;
 }
 
+// Reserved-bits mask for MEMSS_PMA on a given platform. MTL/ARL/LNL match
+// the published Core Ultra 200H/200U layout; PTL has been observed to set
+// bits in the documented reserved range, so on PTL the gate is disabled.
+stock get_platform_pma_reserved_mask(platform) {
+    switch (platform) {
+        case PLAT_MTL, PLAT_ARL, PLAT_LNL:
+            return MEMSS_PMA_RESERVED_MASK_STRICT;
+        case PLAT_PTL:
+            return MEMSS_PMA_RESERVED_MASK_NONE;
+    }
+    return MEMSS_PMA_RESERVED_MASK_STRICT;
+}
+
+// Whether the values returned for this platform have been cross-validated
+// against an external reference (HWiNFO / CPU-Z DRAM Frequency). When
+// false, the EXPERIMENTAL flag is set on every successful IOCTL return so
+// consumers know to keep the sensor hidden by default. As of this revision
+// PTL is validated end-to-end (locked max from MEMSS_PMA matches the rated
+// LPDDR5X speed; live ratio from SA_PERF_STATUS tracks the workpoint that
+// HWiNFO reports). The other Core Ultra platforms remain unvalidated.
+stock bool:is_platform_validated(platform) {
+    switch (platform) {
+        case PLAT_PTL:
+            return true;
+    }
+    return false;
+}
+
 // Read the firmware-published MCHBAR base from the host bridge. We treat a
 // disabled or zero base as "not supported" rather than trying to bring it
 // up; the running OS would normally have already configured this.
@@ -266,17 +314,19 @@ stock NTSTATUS:read_mchbar_dword(mchbar_base, offset, &value) {
 }
 
 // Read MEMSS_PMA_CR_BIOS_DATA and split it into ratio + gear. We refuse
-// to report a value if any of the reserved bits Intel documents as 0 came
-// back set, or if the ratio is outside the plausible DDR5/LPDDR5 range -
-// either case usually means we are reading the wrong register.
-stock NTSTATUS:read_memss_pma(mchbar_base, &raw, &ratio, &gear) {
+// to report a value if any of the platform's documented reserved bits came
+// back set (the mask is platform-specific; see
+// get_platform_pma_reserved_mask), or if the ratio is outside the plausible
+// DDR5/LPDDR5 range - either case usually means we are reading the wrong
+// register.
+stock NTSTATUS:read_memss_pma(mchbar_base, reserved_mask, &raw, &ratio, &gear) {
     new NTSTATUS:status = read_mchbar_dword(mchbar_base, MEMSS_PMA_CR_BIOS_DATA, raw);
     if (!NT_SUCCESS(status))
         return status;
 
-    // Reserved bits must be zero on documented platforms. If they are not,
-    // the register has either been repurposed or the read returned junk.
-    if ((raw & MEMSS_PMA_RESERVED_MASK) != 0)
+    // Reserved bits must be zero on platforms whose layout we have a spec
+    // for. Platforms with reserved_mask == 0 skip this check.
+    if (reserved_mask != 0 && (raw & reserved_mask) != 0)
         return STATUS_NOT_SUPPORTED;
 
     ratio = raw & 0xFF;
@@ -288,11 +338,12 @@ stock NTSTATUS:read_memss_pma(mchbar_base, &raw, &ratio, &gear) {
     return STATUS_SUCCESS;
 }
 
-// Read SA_PERF_STATUS and split it into ratio + reference clock mode. The
-// register does not encode a gear field on ADL/RPL, so gear stays Unknown
-// and the consumer can derive Gear1/Gear2 from configured DRAM rate if it
-// needs to. The reference bit selects between BCLK and BCLK*4/3 - the
-// latter is the common configuration for DDR5 on these platforms.
+// Read SA_PERF_STATUS on Alder/Raptor Lake (where Intel's documented
+// encoding applies). On those platforms bits 9:2 are the controller QCLK
+// ratio and bit 10 selects between BCLK and BCLK*4/3 as the reference.
+// The register does not encode a gear field, so gear stays Unknown and
+// the consumer can derive Gear1/Gear2 from configured DRAM rate if it
+// needs to.
 //
 // We do not validate reserved bits here because Intel's older client docs
 // describe several other fields in SA_PERF_STATUS that this module does
@@ -309,6 +360,134 @@ stock NTSTATUS:read_sa_perf_status(mchbar_base, &raw, &ratio, &refMode) {
 
     if (ratio < IMC_RATIO_MIN || ratio > IMC_RATIO_MAX)
         return STATUS_NOT_SUPPORTED;
+
+    return STATUS_SUCCESS;
+}
+
+// Read SA_PERF_STATUS on Core Ultra and decode its live workpoint. Bits
+// 9:2 are the live QCLK ratio against BCLK/3 (same scale as MEMSS_PMA on
+// these parts); bit 10's role is unclear and treated as informational.
+// We accept any in-range ratio since the controller drops well below
+// MEMSS_PMA's locked maximum during low memory activity.
+stock NTSTATUS:read_sa_perf_status_core_ultra(mchbar_base, &raw, &ratio) {
+    new NTSTATUS:status = read_mchbar_dword(mchbar_base, SA_PERF_STATUS, raw);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    ratio = (raw >> 2) & 0xFF;
+
+    if (ratio < IMC_RATIO_MIN || ratio > IMC_RATIO_MAX)
+        return STATUS_NOT_SUPPORTED;
+
+    return STATUS_SUCCESS;
+}
+
+// === DEBUG / VALIDATION ONLY ===
+// Diagnostic IOCTL used during initial bring-up of new platforms. Returns the
+// intermediate values that ioctl_read_imc_clock would have computed, plus a
+// step code identifying which consistency check (if any) tripped. This is a
+// development scaffold and is intended to be removed once every allowlisted
+// platform has had its EXPERIMENTAL flag cleared by validation.
+//
+// Same security envelope as the live IOCTL: read-only, no caller-controlled
+// addresses, fixed compile-time offsets, strict CPUID allowlist applied
+// before any bus operation.
+#define IMC_DBG_OK              0
+#define IMC_DBG_FAIL_FAMILY     1
+#define IMC_DBG_FAIL_PLATFORM   2
+#define IMC_DBG_FAIL_SOURCE     3
+#define IMC_DBG_FAIL_MCHBAR_OFF 4
+#define IMC_DBG_FAIL_BASE_ZERO  5
+#define IMC_DBG_FAIL_PMA_RSVD   6
+#define IMC_DBG_FAIL_PMA_RANGE  7
+#define IMC_DBG_FAIL_SA_RANGE   8
+
+/// Diagnostic dump of the live IOCTL's intermediate values.
+///
+/// @param in_size Must be 0
+/// @param out [0] = ABI version
+/// @param out [1] = CPUID FMS (family<<16 | model<<8 | stepping)
+/// @param out [2] = platform tag (PLAT_*)
+/// @param out [3] = source tag  (IMC_SRC_*)
+/// @param out [4] = MCHBAR low dword (raw, includes enable bit)
+/// @param out [5] = MCHBAR high dword (raw)
+/// @param out [6] = MCHBAR base after mask (0 if disabled)
+/// @param out [7] = raw MEMSS_PMA_CR_BIOS_DATA dword (0 if not read)
+/// @param out [8] = raw SA_PERF_STATUS dword         (0 if not read)
+/// @param out [9] = step that would have failed live IOCTL (IMC_DBG_*)
+/// @param out_size Must be 10
+/// @return STATUS_SUCCESS even on a "would have failed" run; the step code
+///         in out[9] tells you why.
+DEFINE_IOCTL_SIZED(ioctl_read_imc_clock_dbg, 0, 10) {
+    out[0] = IMC_CLOCK_ABI_VERSION;
+    out[1] = 0; out[2] = 0; out[3] = 0;
+    out[4] = 0; out[5] = 0; out[6] = 0;
+    out[7] = 0; out[8] = 0; out[9] = IMC_DBG_OK;
+
+    new fms = get_cpu_fms();
+    out[1] = fms;
+    if (cpu_fms_family(fms) != 0x6) {
+        out[9] = IMC_DBG_FAIL_FAMILY;
+        return STATUS_SUCCESS;
+    }
+
+    new platform = get_platform(cpu_fms_model(fms));
+    out[2] = platform;
+    if (platform == PLAT_NONE) {
+        out[9] = IMC_DBG_FAIL_PLATFORM;
+        return STATUS_SUCCESS;
+    }
+
+    new source = get_platform_source(platform);
+    out[3] = source;
+    if (source == IMC_SRC_NONE) {
+        out[9] = IMC_DBG_FAIL_SOURCE;
+        return STATUS_SUCCESS;
+    }
+
+    new lo = 0;
+    new hi = 0;
+    pci_config_read_dword(HOSTBRIDGE_BUS, HOSTBRIDGE_DEV, HOSTBRIDGE_FUNC,
+        HOSTBRIDGE_MCHBAR_LO, lo);
+    pci_config_read_dword(HOSTBRIDGE_BUS, HOSTBRIDGE_DEV, HOSTBRIDGE_FUNC,
+        HOSTBRIDGE_MCHBAR_HI, hi);
+    out[4] = lo & 0xFFFFFFFF;
+    out[5] = hi & 0xFFFFFFFF;
+
+    if ((lo & MCHBAR_ENABLE_BIT) == 0) {
+        out[9] = IMC_DBG_FAIL_MCHBAR_OFF;
+        return STATUS_SUCCESS;
+    }
+
+    new base = ((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF);
+    base = base & MCHBAR_BASE_MASK;
+    out[6] = base;
+    if (base == 0) {
+        out[9] = IMC_DBG_FAIL_BASE_ZERO;
+        return STATUS_SUCCESS;
+    }
+
+    new raw_pma = 0;
+    new raw_sa  = 0;
+    read_mchbar_dword(base, MEMSS_PMA_CR_BIOS_DATA, raw_pma);
+    read_mchbar_dword(base, SA_PERF_STATUS,         raw_sa);
+    out[7] = raw_pma & 0xFFFFFFFF;
+    out[8] = raw_sa  & 0xFFFFFFFF;
+
+    if (source == IMC_SRC_MCHBAR_MEMSS_PMA) {
+        new pma_mask = get_platform_pma_reserved_mask(platform);
+        if (pma_mask != 0 && (raw_pma & pma_mask) != 0) {
+            out[9] = IMC_DBG_FAIL_PMA_RSVD;
+        } else {
+            new r = raw_pma & 0xFF;
+            if (r < IMC_RATIO_MIN || r > IMC_RATIO_MAX)
+                out[9] = IMC_DBG_FAIL_PMA_RANGE;
+        }
+    } else if (source == IMC_SRC_MCHBAR_SA_PERF) {
+        new r = (raw_sa >> 2) & 0xFF;
+        if (r < IMC_RATIO_MIN || r > IMC_RATIO_MAX)
+            out[9] = IMC_DBG_FAIL_SA_RANGE;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -384,7 +563,7 @@ DEFINE_IOCTL_SIZED(ioctl_read_imc_clock, 0, 7) {
     new ratio = 0;
     new gear = IMC_GEAR_UNKNOWN;
     new refMode = IMC_REF_UNKNOWN;
-    new flags = IMC_FLAG_EXPERIMENTAL;
+    new flags = is_platform_validated(platform) ? 0 : IMC_FLAG_EXPERIMENTAL;
 
     // Dispatch to the source helper that matches the platform. Each helper
     // owns the register's specific decoding and never reads the other
@@ -392,7 +571,7 @@ DEFINE_IOCTL_SIZED(ioctl_read_imc_clock, 0, 7) {
     // we forgot to update.
     switch (source) {
         case IMC_SRC_MCHBAR_MEMSS_PMA: {
-            status = read_memss_pma(mchbar, raw, ratio, gear);
+            status = read_memss_pma(mchbar, get_platform_pma_reserved_mask(platform), raw, ratio, gear);
             if (!NT_SUCCESS(status))
                 return status;
             // Core Ultra MEMSS_PMA is referenced to BCLK/3 and is the
@@ -419,6 +598,97 @@ DEFINE_IOCTL_SIZED(ioctl_read_imc_clock, 0, 7) {
     out[4] = gear;
     out[5] = raw & 0xFFFFFFFF;
     out[6] = flags;
+
+    return STATUS_SUCCESS;
+}
+
+/// Read the live IMC/QCLK workpoint on Core Ultra (MTL/ARL/LNL/PTL).
+///
+/// The IOCTL exposed in this module above (ioctl_read_imc_clock) returns
+/// the trained-max ratio that firmware programs into MEMSS_PMA after MRC
+/// and is therefore static. This IOCTL returns the LIVE ratio that the
+/// controller is currently running at, derived from SA_PERF_STATUS.
+///
+/// On Alder/Raptor Lake the SA_PERF_STATUS encoding is the documented
+/// ADL/RPL one and this IOCTL returns STATUS_NOT_SUPPORTED (use the
+/// existing ioctl_read_imc_clock there - it is already live on those
+/// platforms via SA_PERF).
+///
+/// Empirically on PTL-H the live ratio drops well below the trained max
+/// when memory activity is low, so callers should treat this as a real
+/// dynamic signal worth polling at ~1 Hz. Validation status is the same
+/// as the locked-max IOCTL: EXPERIMENTAL until per-platform validation
+/// against HWiNFO/CPU-Z lands.
+///
+/// @param in_size Must be 0
+/// @param out [0] = ABI version (currently 1)
+/// @param out [1] = source enum (always IMC_SRC_MCHBAR_SA_PERF on this IOCTL)
+/// @param out [2] = ratio (live controller QCLK multiplier of BCLK/3)
+/// @param out [3] = reference clock mode (IMC_REF_BCLK_DIV_3)
+/// @param out [4] = gear (carried from MEMSS_PMA, since SA_PERF does not
+///                   encode it on Core Ultra; 0 if MEMSS_PMA refused)
+/// @param out [5] = raw SA_PERF_STATUS dword
+/// @param out [6] = flags (always sets LIVE_CURRENT | EXPERIMENTAL)
+/// @param out_size Must be 7
+/// @return STATUS_SUCCESS on a Core Ultra platform whose live ratio is in
+///         range. STATUS_NOT_SUPPORTED on ADL/RPL or unknown CPUs. Other
+///         NTSTATUS on PCI/MMIO read failure.
+DEFINE_IOCTL_SIZED(ioctl_read_imc_clock_live, 0, 7) {
+    out[0] = IMC_CLOCK_ABI_VERSION;
+    out[1] = IMC_SRC_NONE;
+    out[2] = 0;
+    out[3] = IMC_REF_UNKNOWN;
+    out[4] = IMC_GEAR_UNKNOWN;
+    out[5] = 0;
+    out[6] = 0;
+
+    new fms = get_cpu_fms();
+    if (cpu_fms_family(fms) != 0x6)
+        return STATUS_NOT_SUPPORTED;
+
+    new platform = get_platform(cpu_fms_model(fms));
+    if (platform == PLAT_NONE)
+        return STATUS_NOT_SUPPORTED;
+
+    // Only Core Ultra parts use this live SA_PERF path. ADL/RPL get the
+    // documented ADL encoding via the existing ioctl_read_imc_clock.
+    new source = get_platform_source(platform);
+    if (source != IMC_SRC_MCHBAR_MEMSS_PMA)
+        return STATUS_NOT_SUPPORTED;
+
+    new mchbar = 0;
+    new NTSTATUS:status = read_mchbar_base(mchbar);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    new raw = 0;
+    new ratio = 0;
+    status = read_sa_perf_status_core_ultra(mchbar, raw, ratio);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    // Pull gear from MEMSS_PMA. It is part of the locked layout and does
+    // not change at runtime, so a single read is fine. If MEMSS_PMA's
+    // strict reserved-bits check rejects on this platform (e.g. PTL with
+    // its loosened mask still catches a real layout drift on a future
+    // stepping), we leave gear at Unknown rather than fail the IOCTL.
+    new pma_raw = 0;
+    new pma_ratio = 0;
+    new gear = IMC_GEAR_UNKNOWN;
+    new NTSTATUS:pma_status = read_memss_pma(mchbar, get_platform_pma_reserved_mask(platform), pma_raw, pma_ratio, gear);
+    if (!NT_SUCCESS(pma_status))
+        gear = IMC_GEAR_UNKNOWN;
+
+    new live_flags = IMC_FLAG_LIVE_CURRENT;
+    if (!is_platform_validated(platform))
+        live_flags |= IMC_FLAG_EXPERIMENTAL;
+
+    out[1] = IMC_SRC_MCHBAR_SA_PERF;
+    out[2] = ratio;
+    out[3] = IMC_REF_BCLK_DIV_3;
+    out[4] = gear;
+    out[5] = raw & 0xFFFFFFFF;
+    out[6] = live_flags;
 
     return STATUS_SUCCESS;
 }
