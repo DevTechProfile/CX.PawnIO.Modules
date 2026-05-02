@@ -158,19 +158,24 @@
 
 // Mask of reserved bits in MEMSS_PMA_CR_BIOS_DATA on platforms whose layout
 // matches Intel's published Core Ultra 200H/200U register reference (MTL,
-// ARL, LNL). Bits 31:9 are reserved-zero on those parts. A nonzero value
-// here means either the register was repurposed in a future stepping or
-// we are on a CPU that mapped a different register at this offset.
+// ARL). Bits 31:9 are reserved-zero on those parts. A nonzero value here
+// means either the register was repurposed in a future stepping or we are
+// on a CPU that mapped a different register at this offset.
 #define MEMSS_PMA_RESERVED_MASK_STRICT  0xFFFFFE00
-// On Panther Lake the register at MCHBAR + 0x13D10 returns nonzero values
-// in the Core-Ultra-200-era reserved range (observed: 0x1E8B0000 on PTL-H
-// model 0xCC). PTL is newer than the spec this module was written against
-// and appears to encode additional fields here, so the strict mask would
-// reject every PTL read despite the ratio in bits 7:0 looking sane. Until
-// PTL's full layout is published, the reserved-bits gate is disabled on PTL
-// and the consistency check relies on the ratio range alone. The
-// EXPERIMENTAL flag is already set on every successful return, so consumers
-// continue to treat the value as best-effort.
+// On Panther Lake AND Lunar Lake the register at MCHBAR + 0x13D10 returns
+// nonzero values in the Core-Ultra-200-era reserved range. Observed:
+//   - PTL-H (model 0xCC): 0x1E8B0000
+//   - LNL   (model 0xBD): 0x1CCC0000  (Core Ultra 7 258V, LPDDR5x-8533)
+// Both parts are newer than (PTL) or use a different memory subsystem from
+// (LNL, LPDDR5x on-package) the Core Ultra 200H/200U spec this module was
+// written against, and appear to encode additional fields in this region.
+// The strict mask would reject every read on these platforms despite the
+// ratio in bits 7:0 decoding correctly (PTL: ratio 64 -> DDR5-8533 confirmed
+// against HWiNFO and SMBIOS; LNL: ratio 64 -> LPDDR5x-8533 confirmed against
+// HWiNFO Memory Clock max 2133 MHz and SMBIOS ConfiguredClockSpeed). Until
+// the full layout for these platforms is published, the reserved-bits gate
+// is disabled on PTL and LNL and the consistency check relies on the ratio
+// range alone.
 #define MEMSS_PMA_RESERVED_MASK_NONE    0
 
 // === Platform tags ===
@@ -235,14 +240,16 @@ stock get_platform_source(platform) {
     return IMC_SRC_NONE;
 }
 
-// Reserved-bits mask for MEMSS_PMA on a given platform. MTL/ARL/LNL match
-// the published Core Ultra 200H/200U layout; PTL has been observed to set
-// bits in the documented reserved range, so on PTL the gate is disabled.
+// Reserved-bits mask for MEMSS_PMA on a given platform. MTL/ARL match
+// the published Core Ultra 200H/200U layout; PTL and LNL have been observed
+// to set bits in the documented reserved range (PTL: 0x1E8B0000 on model
+// 0xCC; LNL: 0x1CCC0000 on model 0xBD), so on those platforms the gate is
+// disabled and the ratio range check carries the consistency burden.
 stock get_platform_pma_reserved_mask(platform) {
     switch (platform) {
-        case PLAT_MTL, PLAT_ARL, PLAT_LNL:
+        case PLAT_MTL, PLAT_ARL:
             return MEMSS_PMA_RESERVED_MASK_STRICT;
-        case PLAT_PTL:
+        case PLAT_PTL, PLAT_LNL:
             return MEMSS_PMA_RESERVED_MASK_NONE;
     }
     return MEMSS_PMA_RESERVED_MASK_STRICT;
@@ -261,10 +268,21 @@ stock get_platform_pma_reserved_mask(platform) {
 //     3,900.6 MHz, Gear Mode 2), SMBIOS ConfiguredClockSpeed, and the kit's
 //     nominal speed grade. See Deploy/VALIDATION-ARL.md. The live IOCTL is
 //     not applicable on ARL (MEMSS_PMA is static after MRC).
-//   - MTL and LNL remain unvalidated.
+//   - LNL is validated end-to-end on Core Ultra 7 258V with on-package
+//     LPDDR5x-8533: MEMSS_PMA decode (ratio 64 / Gear4 / BCLK/3 ref) gives
+//     QCLK 2,133.3 MHz and data rate 8,533 MT/s, matching HWiNFO64 Memory
+//     Clock max (2,133 MHz) and Win32_PhysicalMemory.ConfiguredClockSpeed
+//     (8,533 MT/s) on 8x4 GiB on-package modules. SA_PERF_STATUS live
+//     workpoint ranges (ratios 18, 36, 64 -> 600, 1200, 2133 MHz) bracket
+//     HWiNFO's Memory Clock min/max range (600 - 2133 MHz). Note that on
+//     LNL HWiNFO labels QCLK directly as "Memory Clock" rather than IO
+//     clock; consumers comparing module output to HWiNFO should compare
+//     ratio*BCLK/3 to "Memory Clock" without the *gear/2 step that PTL/ARL
+//     would otherwise need. See Deploy/VALIDATION-LNL.md.
+//   - MTL remains unvalidated.
 stock bool:is_platform_validated(platform) {
     switch (platform) {
-        case PLAT_ARL, PLAT_PTL:
+        case PLAT_ARL, PLAT_PTL, PLAT_LNL:
             return true;
     }
     return false;
