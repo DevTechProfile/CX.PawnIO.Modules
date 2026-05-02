@@ -33,6 +33,42 @@ the kernel-side bits.
 driver or AMX. `Uninstall.ps1` reverses everything except the testsigning
 flag (toggle that with `bcdedit /set testsigning off` if you want).
 
+## Heads-up: PawnIO 2.2.0 is PnP-only
+
+The driver in this bundle is `namazso/PawnIO` v2.2.0, which creates
+`\Device\PawnIO` only from inside the PnP `AddDevice` callback —
+`DriverEntry` never calls `IoCreateDevice` itself. A plain
+`sc.exe create … type= kernel` loads the driver into the kernel but
+exposes **no device**, so `PawnIOUtil test` (and every other usermode
+call) returns `0x80070002` / `ERROR_FILE_NOT_FOUND`. `Install.ps1` in
+this bundle uses exactly that legacy-service pattern and is therefore
+**not sufficient by itself for v2.2.0** — you also have to enumerate the
+driver as a `Root\PawnIO` software device via the bundled INF. From
+elevated PowerShell, after `Install.ps1` has staged the files:
+
+```powershell
+$devcon = 'C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe'
+& $devcon install (Resolve-Path .\PawnIO-Bundle\driver\PawnIO.inf) 'Root\PawnIO'
+```
+
+`devcon.exe` ships with the WDK (substitute your SDK version). For
+`devcon install` to succeed, both `PawnIO.sys` and `pawnio.cat` must be
+signed by a cert that lives in `LocalMachine\Root` +
+`LocalMachine\TrustedPublisher` (`Install.ps1` already imports
+`PawnIO_TestCert.cer` into both). After devcon completes, `\Device\PawnIO`
+exists and `PawnIOUtil test` works.
+
+### Marked-for-deletion lock — reboot required
+
+If you ran `Install.ps1` once on a v2.2.0 driver and try to re-install
+(or run `devcon install` to fix the missing device), setupapi fails with
+error `1072 (ERROR_SERVICE_MARKED_FOR_DELETE)`: the old `PawnIO` service
+is still loaded with no `DriverUnload` available, so `sc.exe stop` /
+`sc.exe delete` only flag it for deletion. The marked service can't be
+recreated until the old image is unloaded, which only happens at the
+**next reboot**. Diagnose via `C:\Windows\INF\setupapi.dev.log`
+(search for `pawnio` and `Error 1072`).
+
 ## What runs out of the box
 
 | CPU family   | CPUID model | IOCTL behaviour                                 |
