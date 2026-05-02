@@ -251,13 +251,20 @@ stock get_platform_pma_reserved_mask(platform) {
 // Whether the values returned for this platform have been cross-validated
 // against an external reference (HWiNFO / CPU-Z DRAM Frequency). When
 // false, the EXPERIMENTAL flag is set on every successful IOCTL return so
-// consumers know to keep the sensor hidden by default. As of this revision
-// PTL is validated end-to-end (locked max from MEMSS_PMA matches the rated
-// LPDDR5X speed; live ratio from SA_PERF_STATUS tracks the workpoint that
-// HWiNFO reports). The other Core Ultra platforms remain unvalidated.
+// consumers know to keep the sensor hidden by default. As of this revision:
+//   - PTL is validated end-to-end (locked max from MEMSS_PMA matches the
+//     rated LPDDR5X speed; live ratio from SA_PERF_STATUS tracks the
+//     workpoint HWiNFO reports). See Deploy/VALIDATION-PTL.md.
+//   - ARL is validated for the locked-max IOCTL on Arrow Lake-S 285K with
+//     a DDR5-7800 EXPO kit: MEMSS_PMA decode (ratio 117 / Gear2) reproduces
+//     7800 MT/s exactly, agreeing with HWiNFO64 Memory Clock (3,899.6 --
+//     3,900.6 MHz, Gear Mode 2), SMBIOS ConfiguredClockSpeed, and the kit's
+//     nominal speed grade. See Deploy/VALIDATION-ARL.md. The live IOCTL is
+//     not applicable on ARL (MEMSS_PMA is static after MRC).
+//   - MTL and LNL remain unvalidated.
 stock bool:is_platform_validated(platform) {
     switch (platform) {
-        case PLAT_PTL:
+        case PLAT_ARL, PLAT_PTL:
             return true;
     }
     return false;
@@ -614,6 +621,13 @@ DEFINE_IOCTL_SIZED(ioctl_read_imc_clock, 0, 7) {
 /// existing ioctl_read_imc_clock there - it is already live on those
 /// platforms via SA_PERF).
 ///
+/// On Arrow Lake-S (Core Ultra 200 desktop) the SA_PERF_STATUS register
+/// at the inherited MCHBAR+0x5918 offset reads as zero even with SAGV
+/// active and observable HWiNFO Memory Clock variance, so this IOCTL
+/// short-circuits to STATUS_NOT_SUPPORTED on PLAT_ARL until a working
+/// live source for that platform is identified (likely Intel PMT).
+/// See Deploy/VALIDATION-ARL.md for the diagnostic capture.
+///
 /// Empirically on PTL-H the live ratio drops well below the trained max
 /// when memory activity is low, so callers should treat this as a real
 /// dynamic signal worth polling at ~1 Hz. Validation status is the same
@@ -654,6 +668,18 @@ DEFINE_IOCTL_SIZED(ioctl_read_imc_clock_live, 0, 7) {
     // documented ADL encoding via the existing ioctl_read_imc_clock.
     new source = get_platform_source(platform);
     if (source != IMC_SRC_MCHBAR_MEMSS_PMA)
+        return STATUS_NOT_SUPPORTED;
+
+    // ARL-S short-circuit. Validated empirically on Core Ultra 9 285K
+    // (model 0xC6) with SAGV active and HWiNFO observing real Memory
+    // Clock variance from 2400 to 3900 MHz: SA_PERF_STATUS at the
+    // ADL/RPL/PTL offset MCHBAR+0x5918 reads as 0x00000000 even while
+    // the controller is mid-transition. The register either does not
+    // live at this offset on ARL-S or is not populated by the SoC's
+    // power management. The static MEMSS_PMA path covers the locked-max
+    // use case; the live workpoint needs a different source on ARL
+    // (PMT telemetry is the most likely candidate, see VALIDATION-ARL).
+    if (platform == PLAT_ARL)
         return STATUS_NOT_SUPPORTED;
 
     new mchbar = 0;
