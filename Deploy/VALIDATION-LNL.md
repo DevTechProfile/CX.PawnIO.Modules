@@ -128,19 +128,23 @@ Distinct MEMSS_PMA ratios: 64 -- distinct SA_PERF ratios: 18, 48, 64
 
 ## Cross-validation against external references
 
-External cross-check via HWiNFO64 -- user-reported sensor range on this 258V box: Memory Clock min 600 MHz, max 2,133 MHz.
+External cross-check via HWiNFO64 v8.14-5580 -- see [`screenshots/LNL_hwinfo_memory_clocks.png`](../screenshots/LNL_hwinfo_memory_clocks.png) for the captured Sensors view (host: ASUS UX5406SA / Core Ultra 7 258V).
 
 | Source                                    | Reported value | Notes |
 |---|---|---|
-| Module diagnostic IOCTL (locked max)      | QCLK = 2,133 MHz, data rate = 8,533 MT/s, IO = 4,267 MHz | derived as ratio=64 x BCLK/3 x gear=4 |
-| Module diagnostic SA_PERF (live workpoint)| see time-series tables above | bypasses the static gate |
-| HWiNFO64 Memory Clock (max, user-reported)| 2,133 MHz | matches QCLK exactly (= ratio 64 x 33.333 MHz) |
-| HWiNFO64 Memory Clock (min, user-reported)| 600 MHz   | matches ratio 18 x 33.333 MHz = 600 MHz idle workpoint |
-| Win32_PhysicalMemory.ConfiguredClockSpeed | 8,533 MT/s (per DIMM) | matches the data rate above |
+| Module diagnostic IOCTL (locked max)      | QCLK = 2,133.3 MHz, data rate = 8,533 MT/s, IO = 4,267 MHz | derived as ratio=64 x BCLK/3 x gear=4 |
+| Module static IOCTL                       | QCLK = 2,133.3 MHz, Flags = 0x1 (`STATIC_LOCKED`) | gate now open on LNL; matches the diagnostic decode |
+| Module live IOCTL (single sample)         | QCLK = 2,133.3 MHz, Gear = Gear4 | live; live workpoint range in the time-series tables above |
+| HWiNFO64 Memory Clock (cur/min/max/avg)   | 2,133.3 / 600.0 / 2,133.3 / 2,032.0 MHz | matches QCLK exactly (= ratio 64 x 33.333 MHz at max, ratio 18 x 33.333 MHz at min) |
+| HWiNFO64 Memory Clock Ratio (cur/min/max) | 21.33x / 6.00x / 21.33x | equals module ratio / 3 (HWiNFO uses BCLK as the reference, the module uses BCLK/3) |
+| HWiNFO64 Gear Mode                        | 2 | **does not match** the module's `Gear4` decode -- see note below |
+| Win32_PhysicalMemory.ConfiguredClockSpeed | 8,533 MT/s (per DIMM, 8 x 4 GiB on-package) | matches the data rate above |
 
 On Lunar Lake, HWiNFO64's "Memory Clock" sensor reports **QCLK directly** (2,133 MHz at the locked-max workpoint), not IO clock as on PTL/ARL. This is consistent with LPDDR5x's clock hierarchy where the WCK (write clock) operates at QCLK and DRAM data is quad-pumped against it. The module's `ratio * BCLK/3` formula therefore lands on the value HWiNFO surfaces as Memory Clock without any additional doubling.
 
-Three independent references -- the module's MEMSS_PMA decode (QCLK 2,133 MHz / data rate 8,533 MT/s), HWiNFO64's Memory Clock range (600-2,133 MHz bracketing the SA_PERF live workpoint range), and the SMBIOS DRAM data (8,533 MT/s configured) -- all agree on **LPDDR5x-8533, QCLK 2,133 MHz, locked at MRC**. The HWiNFO live floor of 600 MHz reproduces the lowest SA_PERF ratio observed in the time-series tables.
+**Gear Mode label discrepancy.** HWiNFO64 reports Gear Mode = 2 while the module decodes MEMSS_PMA bit 8 = 1 as Gear4. The data rate constraint resolves which interpretation reconstructs the rated speed: ratio 64 x BCLK/3 x **4** = 8,533 MT/s (matches SMBIOS), whereas ratio 64 x BCLK/3 x **2** = 4,267 MT/s (would be DDR5-4267, which this kit isn't). HWiNFO's Gear Mode on LPDDR5x apparently encodes the controller-fabric:DRAM ratio rather than the WCK:CK ratio the MEMSS_PMA `GEAR_TYPE` field describes -- both labels are internally consistent within their own naming conventions, but they do not map 1:1. The module's gear value is the one to trust for data-rate reconstruction; HWiNFO's Gear Mode should be treated as a separate sensor.
+
+Four independent references -- the module's MEMSS_PMA decode (QCLK 2,133 MHz / data rate 8,533 MT/s), HWiNFO64's Memory Clock range (600 - 2,133 MHz bracketing the SA_PERF live workpoint range), HWiNFO64's Memory Clock Ratio (21.33x = 64/3), and SMBIOS ConfiguredClockSpeed (8,533 MT/s) -- all agree on **LPDDR5x-8533, QCLK 2,133 MHz, locked at MRC**. The HWiNFO live floor of 600 MHz (Memory Clock Ratio 6.00x) reproduces the lowest SA_PERF ratio (18 = 6.00 x 3) observed in the time-series tables.
 
 ## Module changes that landed alongside this validation
 
