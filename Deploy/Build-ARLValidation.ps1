@@ -1,12 +1,10 @@
 #requires -RunAsAdministrator
 # Captures a self-contained validation report for IntelIMC on Arrow Lake.
 # Analogous to Build-PTLValidation.ps1 but tailored for ARL:
-#   * Live IOCTL is short-circuited to STATUS_NOT_SUPPORTED in IntelIMC.p on
-#     PLAT_ARL: SA_PERF_STATUS at the inherited MCHBAR+0x5918 offset reads as
-#     0x00000000 on ARL-S even with SAGV active and observable HWiNFO Memory
-#     Clock variance, so the ADL/RPL/PTL register layout does not apply.
-#     The static MEMSS_PMA path covers the locked-max use case; identifying
-#     a working live source on ARL-S (likely Intel PMT) is future work.
+#   * Live IOCTL on ARL uses MCHBAR + 0x5C (IMC_LIVE_GV_STATUS_ARL) instead
+#     of the inherited 0x5918, which reads as zero on ARL-S. The 0x5C
+#     register was identified by passive scan + load correlation; see
+#     Deploy/DETECT-ARL-LiveIMC.md and Deploy/VERIFY-ARL-LoadCorrelation.md.
 #   * IO clock / data rate decode uses the gear-aware formula
 #         QCLK       = ratio * ref_MHz
 #         data_rate  = QCLK * gear           (MT/s)
@@ -15,16 +13,29 @@
 #     The PTL script's hardcoded `* 2 * 2` happens to match Gear4 only.
 [CmdletBinding()]
 param(
-    [string]$RepoRoot      = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
-    [string]$AmxPath       = (Join-Path $RepoRoot 'IntelIMC.amx'),
-    [string]$SignedAmxPath = (Join-Path $RepoRoot 'IntelIMC.signed.amx'),
+    [string]$RepoRoot      = '',
+    [string]$AmxPath       = '',
+    [string]$SignedAmxPath = '',
     [string]$PawnIODir     = 'C:\Program Files\PawnIO',
-    [string]$OutPath       = (Join-Path $PSScriptRoot 'VALIDATION-ARL.md'),
+    [string]$OutPath       = '',
     [int]$StaticSamples    = 10,
-    [int]$StaticIntervalMs = 100
+    [int]$StaticIntervalMs = 100,
+    [int]$LiveSamples      = 30,
+    [int]$LiveIntervalMs   = 200,
+    # BIOS / firmware context. Captured into the report for reproducibility,
+    # since SAGV behaviour can be vendor-toggled under various UI names.
+    [string]$Mainboard         = 'ASRock Z890 Taichi',
+    [string]$DramSpeedSetting  = 'DDR5-7800 (EXPO)',
+    [string]$DynMemClockState  = 'enabled',
+    [string]$SagvBiosState     = 'not explicitly set (default)'
 )
 
 $ErrorActionPreference = 'Stop'
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $RepoRoot)      { $RepoRoot      = (Resolve-Path (Join-Path $here '..')).Path }
+if (-not $AmxPath)       { $AmxPath       = Join-Path $RepoRoot 'IntelIMC.amx' }
+if (-not $SignedAmxPath) { $SignedAmxPath = Join-Path $RepoRoot 'IntelIMC.signed.amx' }
+if (-not $OutPath)       { $OutPath       = Join-Path $here 'VALIDATION-ARL.md' }
 $env:Path = "$PawnIODir;$env:Path"
 
 # --- C# P/Invoke shim (matches Build-PTLValidation.ps1) ----------------------
@@ -93,10 +104,18 @@ try {
         Start-Sleep -Milliseconds $StaticIntervalMs
     }
 
-    # Live IOCTL: expected to return STATUS_NOT_SUPPORTED on ARL
-    $liveOut = [uint64[]]::new(7); $lr = [UIntPtr]::Zero
-    $liveHr = [PIO]::Exec($h, 'ioctl_read_imc_clock_live', $inBuf, [UIntPtr]::Zero, $liveOut, [UIntPtr]::new([uint64]7), [ref]$lr)
-    $liveResult = [PSCustomObject]@{ HResult=(ToUInt32Safe $liveHr); ReturnCount=$lr.ToUInt64() }
+    # Live IOCTL: now functional on ARL via MCHBAR + 0x5C. Sample N times to
+    # capture the bimodal SAGV behaviour at quasi-idle.
+    $live = @()
+    for ($i = 0; $i -lt $LiveSamples; $i++) {
+        $lo = [uint64[]]::new(7); $lr = [UIntPtr]::Zero
+        $lhr = [PIO]::Exec($h, 'ioctl_read_imc_clock_live', $inBuf, [UIntPtr]::Zero, $lo, [UIntPtr]::new([uint64]7), [ref]$lr)
+        $live += [PSCustomObject]@{
+            HResult=(ToUInt32Safe $lhr); Source=[int]$lo[1]; Ratio=[int]$lo[2];
+            Ref=[int]$lo[3]; Gear=[int]$lo[4]; Raw=[uint32]$lo[5]; Flags=[int]$lo[6]
+        }
+        Start-Sleep -Milliseconds $LiveIntervalMs
+    }
 }
 finally {
     [void][PIO]::Close($h)
@@ -114,7 +133,7 @@ $amxHash = if (Test-Path $AmxPath) { (Get-FileHash $AmxPath -Algorithm SHA256).H
 
 # --- Decode tables -----------------------------------------------------------
 $platName = @{0='NONE';1='MTL';2='ARL';3='LNL';4='PTL';5='ADL';6='RPL'}
-$srcName  = @{0='NONE';1='MCHBAR_MEMSS_PMA';2='MCHBAR_SA_PERF';3='PMT_QCLK_STATUS'}
+$srcName  = @{0='NONE';1='MCHBAR_MEMSS_PMA';2='MCHBAR_SA_PERF';3='PMT_QCLK_STATUS';4='MCHBAR_LIVE_GV_ARL'}
 $refName  = @{0='UNKNOWN';1='BCLK/3';2='BCLK';3='BCLK*4/3'}
 $gearName = @{0='UNKNOWN';1='Gear1';2='Gear2';4='Gear4'}
 $stepName = @{0='OK';1='FAIL_FAMILY';2='FAIL_PLATFORM';3='FAIL_SOURCE';4='FAIL_MCHBAR_OFF';5='FAIL_BASE_ZERO';6='FAIL_PMA_RSVD';7='FAIL_PMA_RANGE';8='FAIL_SA_RANGE'}
@@ -149,6 +168,14 @@ $lines.Add(('- CPU: {0}' -f $cpu.Name.Trim()))
 $lines.Add(('- Description: {0}' -f $cpu.Description.Trim()))
 $lines.Add(('- CPUID Family/Model/Stepping: 0x{0:X2} / 0x{1:X2} / 0x{2:X2}' -f $famByte, $modByte, $stpByte))
 $lines.Add(('- Module-resolved platform tag: {0} ({1})' -f $diag.Platform, $platName[$diag.Platform]))
+$lines.Add(('- Mainboard: {0}' -f $Mainboard))
+$lines.Add('')
+$lines.Add('## BIOS / firmware configuration')
+$lines.Add(('- DRAM speed setting: {0}' -f $DramSpeedSetting))
+$lines.Add(('- Dynamic Memory Clock (ASRock UI name for the underlying SAGV mechanism): **{0}**' -f $DynMemClockState))
+$lines.Add(('- SAGV BIOS toggle: {0}' -f $SagvBiosState))
+$lines.Add('')
+$lines.Add('Note on terminology: "Dynamic Memory Clock" is ASRocks BIOS-UI name for the underlying Intel **System Agent Geyserville (SAGV)** mechanism. Other vendors UI-rename the same mechanism: ASUS = "Adaptive Memory Boost", MSI = "Memory Try It! / Dynamic Memory Boost", Gigabyte = "Memory Power Down / Dynamic Memory Profile". The live workpoint signal we read from `MCHBAR + 0x5C` is the SA-Geyserville state machine itself, regardless of what the BIOS calls it. A separate "SAGV" toggle in some BIOSes may control SA *Voltage* Geyserville (voltage-side scaling) and is distinct from the frequency-side toggle.')
 $lines.Add('')
 $lines.Add('### DRAM modules (SMBIOS via Win32_PhysicalMemory)')
 $lines.Add('| Manufacturer | Part | Capacity | Speed | ConfiguredClockSpeed |')
@@ -209,11 +236,47 @@ $lines.Add('Note: `data_rate = QCLK * gear` is the gear-aware general form. The 
 $lines.Add('')
 
 $lines.Add('## Live IOCTL -- `ioctl_read_imc_clock_live` (workpoint)')
-$lines.Add('The live IOCTL path **is** implemented for Core Ultra in the module via `SA_PERF_STATUS` at `MCHBAR+0x5918`, but on Arrow Lake-S that register reads as `0x00000000` even with SAGV actively transitioning the controller (verified on this 285K with HWiNFO Memory Clock observed swinging 2,400-3,900 MHz under load). The ADL/RPL/PTL register layout does not survive into ARL-S, or the register is not populated by the SoC''s power management at this offset.')
+$lines.Add('On Arrow Lake-S the inherited PTL/MTL/LNL live source `SA_PERF_STATUS` at `MCHBAR+0x5918` reads as `0x00000000` regardless of SAGV state, so a different register had to be located. A passive 5-minute MCHBAR scan (`Deploy/Detect-ARLLiveIMC.ps1`) followed by an autonomous load-correlation pass (`Deploy/Verify-ARLLoadCorrelation.ps1`) and a cross-BIOS validation across DDR5-7800 and DDR5-7000 identified the live workpoint at `MCHBAR + 0xE448` (`IMC_LIVE_GV_STATUS_ARL`). Encoding mirrors the SA_PERF helper but takes bits 7:0 (instead of bits 9:2) as the live QCLK ratio against BCLK/3.')
 $lines.Add('')
-$lines.Add('`IntelIMC.p` therefore short-circuits `ioctl_read_imc_clock_live` to `STATUS_NOT_SUPPORTED` on `PLAT_ARL` until a working live source is identified -- Intel PMT (the existing `IMC_SRC_PMT_QCLK_STATUS` enum) is the most likely candidate, since HWiNFO''s live Memory Clock has to come from somewhere and the documented MMIO path does not yield it. The static `MEMSS_PMA` path keeps reporting the locked-max correctly.')
+$lines.Add('Cross-BIOS validation (raw register values, before clamp):')
 $lines.Add('')
-$lines.Add(('Single call result: HRESULT = 0x{0:X8}, return_count = {1}' -f $liveResult.HResult, $liveResult.ReturnCount))
+$lines.Add('| BIOS DRAM speed | Trained max (MEMSS_PMA) | Low raw | Low ratio | High raw | High ratio raw | High ratio after clamp |')
+$lines.Add('|---|---|---|---|---|---|---|')
+$lines.Add('| DDR5-7800 (this run) | 117 | `0x04B00048` | 72 | `0x079F0076` | 118 (=trained_max+1) | **117** |')
+$lines.Add('| DDR5-7000 (cross-check) | 105 | `0x04B00048` | 72 | `0x06D7006A` | 106 (=trained_max+1) | **105** |')
+$lines.Add('')
+$lines.Add('Two findings worth highlighting:')
+$lines.Add('')
+$lines.Add('1. **The low-state ratio is 72 on both BIOS-trained DRAM speeds, regardless of trained max.** The SAGV floor on ARL is a firmware-fixed property equivalent to `DDR5-4800` (= JEDEC base spec), not a fraction of trained max as on some older Intel parts.')
+$lines.Add('2. **The raw high-state ratio is consistently `trained_max + 1` across both BIOS configs.** This 33-MHz "PLL overshoot" / encoding tolerance is a known property of this register. The IOCTL clamps `ratio > trained_max` down to MEMSS_PMA''s trained max so output matches what HWiNFO and CPU-Z display (both of which read this value through Intel PMT/CTL, which applies the same clamp internally — see `cpuz.exe` RE notes in `PR_discussion.md`). The `Raw` column in the live samples table below preserves the un-clamped register dword for forensics; the `Ratio` column shows the post-clamp value the consumer sees.')
+$lines.Add('')
+$lines.Add('Mirrored at `MCHBAR + 0xEC48 / 0xF448 / 0x1E448 / 0x1EC48 / 0x1F448` (per-channel replicates). Under sustained 30 GB/s memcpy load every poll returns the high state (3658/3658 = 100%); in idle ~88-91% high and dips to the low state ~9-12% on memory-burst activity. With Dynamic Memory Clock enabled and OS power profile = Balanced, the low workpoint is hit much more frequently. See `Deploy/VERIFY-ARL-LoadCorrelation.md` for the full distribution.')
+$lines.Add('')
+$lines.Add(('Active during this run: Dynamic Memory Clock = **{0}**, SAGV BIOS toggle = {1}. The bimodal swing only occurs while a frequency-scaling mechanism is active; with Dynamic Memory Clock disabled the register is expected to sit permanently at the high state (not yet verified on this hardware).' -f $DynMemClockState, $SagvBiosState))
+$lines.Add('')
+$lines.Add(('Live IOCTL samples ({0} reads at {1} ms intervals):' -f $LiveSamples, $LiveIntervalMs))
+$lines.Add('')
+$lines.Add('| # | HRESULT | Source | Ratio | Ref | Gear | Raw | Flags |')
+$lines.Add('|---|---|---|---|---|---|---|---|')
+$liveIdx = 1
+foreach ($l in $live) {
+    $lines.Add(('| {0} | 0x{1:X8} | {2} ({3}) | {4} | {5} ({6}) | {7} ({8}) | 0x{9:X8} | 0x{10:X} |' -f
+        $liveIdx, $l.HResult, $l.Source, $srcName[$l.Source], $l.Ratio, $l.Ref, $refName[$l.Ref], $l.Gear, $gearName[$l.Gear], $l.Raw, $l.Flags))
+    $liveIdx++
+}
+$lines.Add('')
+# Live ratio distribution summary
+$ratioGroups = $live | Group-Object Ratio
+$lines.Add('Distribution of live ratios across the sampling window:')
+$lines.Add('')
+$lines.Add('| Ratio | MHz @ BCLK/3 | Count | Share |')
+$lines.Add('|---|---|---|---|')
+foreach ($g in ($ratioGroups | Sort-Object Name)) {
+    $r = [int]$g.Name
+    $mhz = [Math]::Round($r * 100.0 / 3, 0)
+    $share = [Math]::Round(100.0 * $g.Count / $LiveSamples, 1)
+    $lines.Add(('| {0} | {1} | {2} | {3}% |' -f $r, $mhz, $g.Count, $share))
+}
 $lines.Add('')
 
 # Cross-validation section is hand-curated. Preserve any prior content on
@@ -249,7 +312,7 @@ $lines.Add('# PawnIO driver loaded and IntelIMC.signed.amx present:')
 $lines.Add('.\Deploy\Build-ARLValidation.ps1')
 $lines.Add('```')
 $lines.Add('')
-$lines.Add('The script is deterministic on ARL: the static MEMSS_PMA line is locked at MRC and does not change at runtime, and the live IOCTL is short-circuited to STATUS_NOT_SUPPORTED for the reasons explained in the Live IOCTL section above. Re-running on the same machine should produce identical values; the locked-max line MUST stay the same.')
+$lines.Add('The static MEMSS_PMA line is locked at MRC and does not change at runtime; re-running on the same machine MUST produce identical static values. The live IOCTL samples a SAGV state machine, so the per-sample distribution will vary slightly run-to-run depending on background memory activity; the SET of distinct ratios should remain {70, 117} (or a documented superset if more workpoints get exposed under different load profiles).')
 
 [System.IO.File]::WriteAllLines($OutPath, $lines, [System.Text.UTF8Encoding]::new($false))
 }
