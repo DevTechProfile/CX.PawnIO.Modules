@@ -1,5 +1,6 @@
 *.amx
 *.bin
+.claude/
 .vs/
 Deploy/bundle/
 my.key
