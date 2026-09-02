@@ -1,5 +1,5 @@
 //  PawnIO Modules - Modules for various hardware to be used with PawnIO.
-//  Copyright (C) 2026  Adrenalift contributors
+//  Copyright (C) 2026  Adrenalift and CapFrameX contributors
 //
 //  This library is free software; you can redistribute it and/or
 //  modify it under the terms of the GNU Lesser General Public
@@ -18,175 +18,185 @@
 //  SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * RadeonSMU - SMU mailbox access for AMD Radeon (RDNA) GPUs.
+ * RadeonSMU - bounded SMU metrics access for AMD Radeon RDNA GPUs.
  *
- * Replaces WinRing0/InpOut32-style raw physical MMIO for AMD GPU tuning
- * software. Rather than handing out a physical read/write primitive, this
- * module owns the SMN index/data sequence itself and allowlists the SMN
- * addresses a caller may reach, so the exposed surface is the MP1 message
- * mailbox and nothing else.
+ * This is an extension of the RadeonSMU module proposed in
+ * PawnIO.Modules pull request #110. The legacy IOCTLs remain available for
+ * compatibility. ABI 2 adds device identity and fixed-size, read-only metrics
+ * calls sized for the public SMU11 (RDNA2), SMU13.0.0/13.0.7 (RDNA3), and
+ * SMU14 (RDNA4) layouts. Those calls recover and validate the current table
+ * address inside the module when the firmware exposes it through the register
+ * pair used by the original Navi 44 implementation; a caller cannot choose a
+ * physical address.
  *
- * Discovery
- * ---------
- * The module finds the AMD display device itself by PCI scan and reads its
- * own BAR bases and sizes; the caller never supplies a bus/device or a
- * physical address for register access. Selection is by LARGEST VRAM
- * aperture rather than enumeration order, so an AMD iGPU that enumerates
- * first (e.g. Raphael, 256 MB carved from system RAM) cannot shadow a
- * discrete card. `ioctl_get_bounds` lets the caller confirm which device
- * was chosen.
- *
- * Exposed surface
- * ---------------
- *   - SMN reads/writes restricted to the MP1 C2PMSG register file
- *     (0x03B10900..0x03B10AFF, 128 registers). That window is the SMU
- *     message mailbox: MSG (C2PMSG_66), PARAM (C2PMSG_82), RESP
- *     (C2PMSG_90), and the addr_hi/lo pair (C2PMSG_80/81) that PMFW
- *     populates for TransferTableSmu2DramWithAddr.
- *   - One fixed-size read of the SmuMetrics_t DMA buffer, bounded to the
- *     GPU's own VRAM aperture.
- *   - Nothing else. No system RAM, no other devices, no writes to the
- *     framebuffer, and no SMN address outside the mailbox window.
- *
- * The mailbox window is deliberately not gated on message id: every
- * PPSMC message is a write of an id to the same MSG register, so
- * allowlisting the registers rather than the messages keeps present and
- * future firmware messages working without widening the surface. This
- * mirrors RyzenSMU, which likewise bounds SMN ranges and accepts any
- * message id.
- *
- * Reference
- * ---------
- *   - Linux amdgpu: `drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c` (mailbox
- *     protocol: write RESP=0, write PARAM, write MSG, poll RESP) and
- *     `amdgpu_device.c` (PCIE_INDEX2/PCIE_DATA2 indirect SMN access).
- *   - MP1 C2PMSG register numbering: `smu_v14_0.c` / `smu_v13_0.c`,
- *     `mmMP1_SMN_C2PMSG_66/82/90`.
- *   - Navi 4x SmuMetrics_t layout: `smu14_driver_if_v14_0.h`.
+ * The module deliberately does not send an SMU message to refresh the table.
+ * It reads C2PMSG_80/81 and fails closed while no usable address is present.
+ * This address-discovery mechanism is not universal: Navi 31 was verified to
+ * leave both registers at zero even while AMD telemetry is active.
  */
 
 #include <pawnio.inc>
 
-/// PCI vendor id for AMD/ATI.
+const MODULE_ABI_VERSION = 2;
 const AMD_VENDOR_ID = 0x1002;
 
-/// BAR5 offset of PCIE_INDEX2 - the SMN address (index) register.
+/* BAR5 indirect SMN index/data pair. */
 const SMN_INDEX_OFFSET = 0x38;
-/// BAR5 offset of PCIE_DATA2 - the SMN data register.
 const SMN_DATA_OFFSET = 0x3C;
 
-/// First SMN address of the MP1 C2PMSG register file (C2PMSG_0).
-/// C2PMSG_66 is 0x03B10A08, i.e. base + 66*4.
+/* MP1 C2PMSG register file. */
 const MP1_C2PMSG_BASE = 0x03B10900;
-/// Byte span of the C2PMSG register file: 128 registers of 4 bytes.
 const MP1_C2PMSG_SPAN = 0x200;
+const MP1_C2PMSG_80 = MP1_C2PMSG_BASE + 80 * 4;
+const MP1_C2PMSG_81 = MP1_C2PMSG_BASE + 81 * 4;
 
-/// Dword count of `SmuMetrics_t` on Navi 4x (260 bytes). Fixed rather
-/// than caller-supplied so the output array is statically sized.
-const SMU_METRICS_DWORDS = 65;
+/* Public SmuMetrics_t core sizes. RDNA2 uses the largest of its four
+ * published layouts so a user-mode parser can select Base/V2/V3/V4. */
+const SMU11_METRICS_DWORDS = 41;  /* 164 bytes */
+const SMU13_0_0_METRICS_DWORDS = 61;  /* 244 bytes, Navi 31/32 */
+const SMU13_0_7_METRICS_DWORDS = 60;  /* 240 bytes, Navi 33    */
+const SMU14_METRICS_DWORDS = 65;  /* 260 bytes */
 
-/* Fallback register-BAR window, used only if the BAR5 size probe returns
- * something implausible. The MMIO register BAR is ~512 KB on Navi 44;
- * 1 MB is a safe fallback that still stays inside adjacent MMIO. */
+/* Radeon discrete-GPU addresses exposed by this protocol use this VRAM MC base.
+ * The derived offset must still fit the selected PCI BAR0 aperture. */
+const GPU_VRAM_MC_BASE = 0x8000000000;
+
 const REG_SPAN = 0x100000;
-/// Sanity bound on the probed BAR5 size; larger is treated as a bad read.
 const REG_SIZE_MAX = 0x1000000;      /* 16 MB */
-/// Sanity bound on the probed BAR0 size; larger is treated as a bad read.
 const VRAM_SIZE_MAX = 0x1000000000;  /* 64 GB */
 
-/* Discovered at load (main()). */
 new g_ready = 0;
-new g_reg_bar = 0;    /* BAR5 base - MMIO register aperture */
-new g_reg_size = 0;   /* BAR5 size (probed)                 */
-new g_vram_bar = 0;   /* BAR0 base - VRAM aperture          */
-new g_vram_size = 0;  /* BAR0 size (probed)                 */
+new g_pci_bus = 0;
+new g_pci_device = 0;
+new g_pci_function = 0;
+new g_device_id = 0;
+new g_revision_id = 0;
+new g_subsystem_vendor_id = 0;
+new g_subsystem_device_id = 0;
+new g_reg_bar = 0;
+new g_reg_size = 0;
+new g_vram_bar = 0;
+new g_vram_size = 0;
 
 /* ---------------------------------------------------------------------
  * Discovery
  * ------------------------------------------------------------------- */
 
-/// Find the AMD VGA controller with the largest VRAM aperture, read its
-/// register and VRAM BAR bases, and probe both sizes. Sets g_ready on
-/// success. If it fails, `main()` refuses the load with STATUS_NOT_SUPPORTED.
 find_gpu_and_probe() {
-    new best_bus = -1, best_dev = -1;
+    new best_bus = -1, best_device = -1;
     new best_vram_bar = 0, best_vram_size = 0;
+    new best_vendor_device = 0, best_class_revision = 0;
+    new best_subsystem = 0;
 
     for (new bus = 0; bus <= 255; bus++) {
-        for (new dev = 0; dev < 32; dev++) {
-            new vd = 0;
-            if (pci_config_read_dword(bus, dev, 0, 0x00, vd) != STATUS_SUCCESS) continue;
-            if ((vd & 0xFFFF) != AMD_VENDOR_ID) continue;
+        for (new device = 0; device < 32; device++) {
+            new vendor_device = 0;
+            if (pci_config_read_dword(bus, device, 0, 0x00, vendor_device) != STATUS_SUCCESS)
+                continue;
+            if ((vendor_device & 0xFFFF) != AMD_VENDOR_ID)
+                continue;
 
-            new cls = 0;
-            if (pci_config_read_dword(bus, dev, 0, 0x08, cls) != STATUS_SUCCESS) continue;
-            if (((cls >> 24) & 0xFF) != 0x03) continue;   /* base class: display */
-            if (((cls >> 16) & 0xFF) != 0x00) continue;   /* sub class:  VGA     */
+            new class_revision = 0;
+            if (pci_config_read_dword(bus, device, 0, 0x08, class_revision) != STATUS_SUCCESS)
+                continue;
+            if (((class_revision >>> 24) & 0xFF) != 0x03)
+                continue;
+            if (((class_revision >>> 16) & 0xFF) != 0x00)
+                continue;
 
-            /* VRAM BAR = BAR0. Validate the type bits before treating
-             * 0x14 as the high half: on a 32-bit-BAR device that offset
-             * is BAR1, and composing the two yields a garbage base. */
-            new b0lo = 0, b0hi = 0;
-            pci_config_read_dword(bus, dev, 0, 0x10, b0lo);
-            if ((b0lo & 0x1) != 0) continue;            /* I/O space  */
-            if (((b0lo >> 1) & 0x3) != 0x2) continue;   /* not 64-bit */
-            pci_config_read_dword(bus, dev, 0, 0x14, b0hi);
-            new vram_bar = (b0hi << 32) | (b0lo & 0xFFFFFFF0);
+            new bar0_low = 0, bar0_high = 0;
+            if (pci_config_read_dword(bus, device, 0, 0x10, bar0_low) != STATUS_SUCCESS)
+                continue;
+            if ((bar0_low & 0x1) != 0)
+                continue;
+            if (((bar0_low >>> 1) & 0x3) != 0x2)
+                continue;
+            if (pci_config_read_dword(bus, device, 0, 0x14, bar0_high) != STATUS_SUCCESS)
+                continue;
 
-            /* Standard write-all-ones / read-mask / restore size probe.
-             * Memory decode is not disabled (PCI config access is
-             * PASSIVE_LEVEL and cannot be IRQL-protected); each BAR is
-             * restored within a few microseconds. */
-            new mlo = 0, mhi = 0;
-            pci_config_write_dword(bus, dev, 0, 0x10, 0xFFFFFFFF);
-            pci_config_write_dword(bus, dev, 0, 0x14, 0xFFFFFFFF);
-            pci_config_read_dword(bus, dev, 0, 0x10, mlo);
-            pci_config_read_dword(bus, dev, 0, 0x14, mhi);
-            pci_config_write_dword(bus, dev, 0, 0x10, b0lo);
-            pci_config_write_dword(bus, dev, 0, 0x14, b0hi);
+            new vram_bar = (bar0_high << 32) | (bar0_low & 0xFFFFFFF0);
 
-            new mask = (mhi << 32) | (mlo & 0xFFFFFFF0);
+            /* Probe BAR0 exactly as the PR implementation does. Restore both
+             * halves immediately, and reject every implausible result. */
+            new mask_low = 0, mask_high = 0;
+            if (pci_config_write_dword(bus, device, 0, 0x10, 0xFFFFFFFF) != STATUS_SUCCESS)
+                continue;
+            if (pci_config_write_dword(bus, device, 0, 0x14, 0xFFFFFFFF) != STATUS_SUCCESS) {
+                pci_config_write_dword(bus, device, 0, 0x10, bar0_low);
+                continue;
+            }
+            new NTSTATUS:read_low_status = pci_config_read_dword(bus, device, 0, 0x10, mask_low);
+            new NTSTATUS:read_high_status = pci_config_read_dword(bus, device, 0, 0x14, mask_high);
+            pci_config_write_dword(bus, device, 0, 0x10, bar0_low);
+            pci_config_write_dword(bus, device, 0, 0x14, bar0_high);
+            if (read_low_status != STATUS_SUCCESS || read_high_status != STATUS_SUCCESS)
+                continue;
+
+            new mask = (mask_high << 32) | (mask_low & 0xFFFFFFF0);
             new vram_size = (~mask) + 1;
+            if (vram_size <= 0 || vram_size > VRAM_SIZE_MAX)
+                continue;
 
-            /* Fail closed on an implausible read-back: skip the device
-             * rather than let a bogus size win the ranking. */
-            if (vram_size <= 0 || vram_size > VRAM_SIZE_MAX) continue;
-
-            /* Tie-break toward the higher PCI bus, where a discrete card
-             * normally sits (an iGPU is typically at bus 00). */
             if (vram_size > best_vram_size ||
                 (vram_size == best_vram_size && bus > best_bus)) {
+                new subsystem = 0;
+                pci_config_read_dword(bus, device, 0, 0x2C, subsystem);
+
                 best_vram_size = vram_size;
                 best_vram_bar = vram_bar;
                 best_bus = bus;
-                best_dev = dev;
+                best_device = device;
+                best_vendor_device = vendor_device;
+                best_class_revision = class_revision;
+                best_subsystem = subsystem;
             }
         }
     }
 
-    if (best_bus < 0) return;   /* no AMD VGA device found */
+    if (best_bus < 0)
+        return;
 
-    new b5 = 0;
-    pci_config_read_dword(best_bus, best_dev, 0, 0x24, b5);
-    if ((b5 & 0x1) != 0) return;                /* must be memory space */
-    new b5type = (b5 >> 1) & 0x3;
-    if (b5type != 0x0 && b5type != 0x2) return; /* reserved encoding    */
-    new b5hi = 0;
-    if (b5type == 0x2) pci_config_read_dword(best_bus, best_dev, 0, 0x28, b5hi);
-    new reg_bar = (b5hi << 32) | (b5 & 0xFFFFFFF0);
+    new bar5_low = 0;
+    if (pci_config_read_dword(best_bus, best_device, 0, 0x24, bar5_low) != STATUS_SUCCESS)
+        return;
+    if ((bar5_low & 0x1) != 0)
+        return;
 
-    new m5 = 0;
-    pci_config_write_dword(best_bus, best_dev, 0, 0x24, 0xFFFFFFFF);
-    pci_config_read_dword(best_bus, best_dev, 0, 0x24, m5);
-    pci_config_write_dword(best_bus, best_dev, 0, 0x24, b5);
-    m5 = m5 & 0xFFFFFFF0;
+    new bar5_type = (bar5_low >>> 1) & 0x3;
+    if (bar5_type != 0x0 && bar5_type != 0x2)
+        return;
+
+    new bar5_high = 0;
+    if (bar5_type == 0x2 &&
+        pci_config_read_dword(best_bus, best_device, 0, 0x28, bar5_high) != STATUS_SUCCESS)
+        return;
+    new reg_bar = (bar5_high << 32) | (bar5_low & 0xFFFFFFF0);
+
+    new bar5_mask = 0;
+    if (pci_config_write_dword(best_bus, best_device, 0, 0x24, 0xFFFFFFFF) != STATUS_SUCCESS)
+        return;
+    new NTSTATUS:bar5_read_status =
+        pci_config_read_dword(best_bus, best_device, 0, 0x24, bar5_mask);
+    pci_config_write_dword(best_bus, best_device, 0, 0x24, bar5_low);
+    if (bar5_read_status != STATUS_SUCCESS)
+        return;
+
+    bar5_mask = bar5_mask & 0xFFFFFFF0;
     new reg_size = 0;
-    if (m5 != 0) reg_size = ((~m5) & 0xFFFFFFFF) + 1;
-    if (reg_size <= 0 || reg_size > REG_SIZE_MAX) reg_size = REG_SPAN;
+    if (bar5_mask != 0)
+        reg_size = ((~bar5_mask) & 0xFFFFFFFF) + 1;
+    if (reg_size <= 0 || reg_size > REG_SIZE_MAX)
+        reg_size = REG_SPAN;
+    if (reg_size < SMN_DATA_OFFSET + 4)
+        return;
 
-    /* The SMN index/data pair must fit inside the register aperture. */
-    if (reg_size < SMN_DATA_OFFSET + 4) return;
-
+    g_pci_bus = best_bus;
+    g_pci_device = best_device;
+    g_pci_function = 0;
+    g_device_id = (best_vendor_device >>> 16) & 0xFFFF;
+    g_revision_id = best_class_revision & 0xFF;
+    g_subsystem_vendor_id = best_subsystem & 0xFFFF;
+    g_subsystem_device_id = (best_subsystem >>> 16) & 0xFFFF;
     g_reg_bar = reg_bar;
     g_reg_size = reg_size;
     g_vram_bar = best_vram_bar;
@@ -195,155 +205,218 @@ find_gpu_and_probe() {
 }
 
 /* ---------------------------------------------------------------------
- * Bounds
+ * Bounds and SMN access
  * ------------------------------------------------------------------- */
 
-/// True iff [pa, pa+len) lies entirely within [base, base+size).
-///
-/// Overflow-safe by construction. Cells are signed 64-bit (-C64), so the
-/// naive `pa + len <= base + size` can wrap for a pa near 2^63 and wrongly
-/// return true. This never adds to pa: it checks `pa >= base` (which also
-/// rejects a negative pa), derives the offset by subtraction, and compares
-/// len against the remaining window, which cannot overflow.
-bool: in_window(pa, len, base, size) {
-    if (size <= 0) return false;
-    if (len <= 0) return false;
-    if (pa < base) return false;
-    new off = pa - base;
-    if (off > size) return false;
-    if (len > size - off) return false;
+bool:in_window(address, length, base, size) {
+    if (size <= 0 || length <= 0)
+        return false;
+    if (address < base)
+        return false;
+    new offset = address - base;
+    if (offset > size)
+        return false;
+    if (length > size - offset)
+        return false;
     return true;
 }
 
-/// True iff `smn_addr` is a dword-aligned address inside the MP1 C2PMSG
-/// register file. This is the entire SMN surface the module exposes.
-bool: smn_allowed(smn_addr) {
-    if ((smn_addr & 0x3) != 0) return false;
-    return in_window(smn_addr, 4, MP1_C2PMSG_BASE, MP1_C2PMSG_SPAN);
+bool:smn_allowed(smn_address) {
+    if ((smn_address & 0x3) != 0)
+        return false;
+    return in_window(smn_address, 4, MP1_C2PMSG_BASE, MP1_C2PMSG_SPAN);
+}
+
+NTSTATUS:smn_read(smn_address, &value) {
+    new VA:virtual_address = io_space_map(g_reg_bar + SMN_INDEX_OFFSET, 8);
+    if (virtual_address == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    new NTSTATUS:status = virtual_write_dword(virtual_address, smn_address);
+    if (status == STATUS_SUCCESS)
+        status = virtual_read_dword(virtual_address + 4, value);
+    io_space_unmap(virtual_address, 8);
+    return status;
+}
+
+NTSTATUS:smn_write(smn_address, value) {
+    new VA:virtual_address = io_space_map(g_reg_bar + SMN_INDEX_OFFSET, 8);
+    if (virtual_address == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    new NTSTATUS:status = virtual_write_dword(virtual_address, smn_address);
+    if (status == STATUS_SUCCESS)
+        status = virtual_write_dword(virtual_address + 4, value);
+    io_space_unmap(virtual_address, 8);
+    return status;
+}
+
+/* Resolve the current metrics pointer exposed through the Navi 44 register
+ * protocol and translate it into the selected BAR0 aperture. Reading
+ * high/low/high rejects a torn register pair. */
+NTSTATUS:resolve_metrics_buffer(length, &gpu_address, &vram_offset, &physical_address) {
+    gpu_address = 0;
+    vram_offset = 0;
+    physical_address = 0;
+
+    if (!g_ready)
+        return STATUS_DEVICE_NOT_READY;
+    if (length <= 0 || length > SMU14_METRICS_DWORDS * 4)
+        return STATUS_INVALID_PARAMETER;
+
+    new high_before = 0, high_after = 0, low = 0;
+    new bool:stable = false;
+    for (new attempt = 0; attempt < 4; attempt++) {
+        new NTSTATUS:status = smn_read(MP1_C2PMSG_80, high_before);
+        if (status != STATUS_SUCCESS)
+            return status;
+        status = smn_read(MP1_C2PMSG_81, low);
+        if (status != STATUS_SUCCESS)
+            return status;
+        status = smn_read(MP1_C2PMSG_80, high_after);
+        if (status != STATUS_SUCCESS)
+            return status;
+        if ((high_before & 0xFFFFFFFF) == (high_after & 0xFFFFFFFF)) {
+            stable = true;
+            break;
+        }
+    }
+    if (!stable)
+        return STATUS_RETRY;
+
+    gpu_address = ((high_before & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF);
+    if ((gpu_address & 0x3) != 0)
+        return STATUS_INVALID_ADDRESS;
+    if (gpu_address < GPU_VRAM_MC_BASE)
+        return STATUS_DEVICE_NOT_READY;
+
+    vram_offset = gpu_address - GPU_VRAM_MC_BASE;
+    if (!in_window(vram_offset, length, 0, g_vram_size))
+        return STATUS_ACCESS_DENIED;
+
+    physical_address = g_vram_bar + vram_offset;
+    if (!in_window(physical_address, length, g_vram_bar, g_vram_size))
+        return STATUS_ACCESS_DENIED;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS:read_current_metrics(dword_count, result[]) {
+    new gpu_address = 0, vram_offset = 0, physical_address = 0;
+    new length = dword_count * 4;
+    new NTSTATUS:status = resolve_metrics_buffer(
+        length,
+        gpu_address,
+        vram_offset,
+        physical_address);
+    if (status != STATUS_SUCCESS)
+        return status;
+
+    new VA:virtual_address = io_space_map(physical_address, length);
+    if (virtual_address == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    for (new i = 0; i < dword_count; i++) {
+        new value = 0;
+        status = virtual_read_dword(virtual_address + i * 4, value);
+        if (status != STATUS_SUCCESS) {
+            io_space_unmap(virtual_address, length);
+            return status;
+        }
+        result[i] = value & 0xFFFFFFFF;
+    }
+
+    io_space_unmap(virtual_address, length);
+    return STATUS_SUCCESS;
 }
 
 /* ---------------------------------------------------------------------
- * SMN access
- * ------------------------------------------------------------------- */
-
-/// Perform the SMN index/data sequence for a read. Both accesses happen
-/// under a single mapping so the pair is not split across ioctl calls.
-NTSTATUS:smn_read(smn_addr, &value) {
-    new VA:va = io_space_map(g_reg_bar + SMN_INDEX_OFFSET, 8);
-    if (va == NULL) return STATUS_INSUFFICIENT_RESOURCES;
-    new NTSTATUS:s = virtual_write_dword(va, smn_addr);
-    if (s == STATUS_SUCCESS) s = virtual_read_dword(va + 4, value);
-    io_space_unmap(va, 8);
-    return s;
-}
-
-/// Perform the SMN index/data sequence for a write.
-NTSTATUS:smn_write(smn_addr, value) {
-    new VA:va = io_space_map(g_reg_bar + SMN_INDEX_OFFSET, 8);
-    if (va == NULL) return STATUS_INSUFFICIENT_RESOURCES;
-    new NTSTATUS:s = virtual_write_dword(va, smn_addr);
-    if (s == STATUS_SUCCESS) s = virtual_write_dword(va + 4, value);
-    io_space_unmap(va, 8);
-    return s;
-}
-
-/* ---------------------------------------------------------------------
- * IOCTLs
+ * Legacy PR #110 IOCTLs
  * ------------------------------------------------------------------- */
 
 /// Read one dword from the SMU message mailbox.
 ///
-/// @param in [0] = SMN address. Must be dword-aligned and inside the MP1
-///           C2PMSG register file (0x03B10900..0x03B10AFF); any other
-///           address returns STATUS_ACCESS_DENIED.
+/// @param in [0] = dword-aligned SMN address inside the MP1 C2PMSG file
 /// @param in_size Must be 1
-/// @param out [0] = the register value, zero-extended to 64 bits
+/// @param out [0] = register value, zero-extended to 64 bits
 /// @param out_size Must be 1
 /// @return An NTSTATUS
 DEFINE_IOCTL_SIZED(ioctl_read_smn, 1, 1) {
-    if (!g_ready) return STATUS_DEVICE_NOT_READY;
-    new smn_addr = in[0];
-    if (!smn_allowed(smn_addr)) return STATUS_ACCESS_DENIED;
+    if (!g_ready)
+        return STATUS_DEVICE_NOT_READY;
+    new smn_address = in[0];
+    if (!smn_allowed(smn_address))
+        return STATUS_ACCESS_DENIED;
 
     new value = 0;
-    new NTSTATUS:s = smn_read(smn_addr, value);
+    new NTSTATUS:status = smn_read(smn_address, value);
     out[0] = value & 0xFFFFFFFF;
-    return s;
+    return status;
 }
 
 /// Write one dword to the SMU message mailbox.
 ///
-/// Writing an id to the MSG register (C2PMSG_66) is how every PPSMC
-/// message is issued; the module deliberately does not gate on message
-/// id, because the register allowlist already confines the effect to this
-/// GPU's mailbox.
-///
-/// @param in [0] = SMN address. Must be dword-aligned and inside the MP1
-///           C2PMSG register file (0x03B10900..0x03B10AFF); any other
-///           address returns STATUS_ACCESS_DENIED.
-///           [1] = value to write; only the low 32 bits are used.
+/// @param in [0] = dword-aligned SMN address inside the MP1 C2PMSG file;
+///           [1] = value to write, with only the low 32 bits used
 /// @param in_size Must be 2
-/// @param out [0] = the NTSTATUS of the underlying register write
+/// @param out [0] = status of the underlying register write
 /// @param out_size Must be 1
 /// @return An NTSTATUS
 DEFINE_IOCTL_SIZED(ioctl_write_smn, 2, 1) {
-    if (!g_ready) return STATUS_DEVICE_NOT_READY;
-    new smn_addr = in[0];
-    if (!smn_allowed(smn_addr)) {
+    if (!g_ready)
+        return STATUS_DEVICE_NOT_READY;
+    new smn_address = in[0];
+    if (!smn_allowed(smn_address)) {
         out[0] = _:STATUS_ACCESS_DENIED & 0xFFFFFFFF;
         return STATUS_ACCESS_DENIED;
     }
 
-    new NTSTATUS:s = smn_write(smn_addr, in[1] & 0xFFFFFFFF);
-    out[0] = _:s & 0xFFFFFFFF;
-    return s;
+    new NTSTATUS:status = smn_write(smn_address, in[1] & 0xFFFFFFFF);
+    out[0] = _:status & 0xFFFFFFFF;
+    return status;
 }
 
-/// Read the SmuMetrics_t DMA buffer from the GPU's VRAM aperture.
+/// Read one SMU14-sized metrics table from a caller-selected address.
 ///
-/// The buffer is allocated and programmed by the AMD display driver, not
-/// by this module; its address is recovered by the caller from the
-/// addr_hi/lo pair the firmware writes to C2PMSG_80/81. The address is
-/// still bounds-checked here rather than trusted.
-///
-/// @param in [0] = host physical address of the buffer. Must be
-///           dword-aligned and lie entirely within the GPU's VRAM
-///           aperture; any other address returns STATUS_ACCESS_DENIED.
+/// @deprecated Use a generation-specific metrics ioctl, which resolves the
+///             address inside the module.
+/// @param in [0] = dword-aligned host physical address inside the selected
+///           GPU's VRAM aperture
 /// @param in_size Must be 1
-/// @param out 65 raw DWORDs - `SmuMetrics_t` (260 bytes) on Navi 4x, each
-///            zero-extended to 64 bits. Layout is firmware-defined; see
-///            `smu14_driver_if_v14_0.h`.
+/// @param out 65 raw DWORDs (260 bytes)
 /// @param out_size Must be 65
 /// @return An NTSTATUS
-DEFINE_IOCTL_SIZED(ioctl_read_metrics, 1, SMU_METRICS_DWORDS) {
-    if (!g_ready) return STATUS_DEVICE_NOT_READY;
-    new pa = in[0];
-    new len = SMU_METRICS_DWORDS * 4;
-    if ((pa & 0x3) != 0) return STATUS_INVALID_PARAMETER;
-    if (!in_window(pa, len, g_vram_bar, g_vram_size)) return STATUS_ACCESS_DENIED;
+DEFINE_IOCTL_SIZED(ioctl_read_metrics, 1, SMU14_METRICS_DWORDS) {
+    if (!g_ready)
+        return STATUS_DEVICE_NOT_READY;
+    new physical_address = in[0];
+    new length = SMU14_METRICS_DWORDS * 4;
+    if ((physical_address & 0x3) != 0)
+        return STATUS_INVALID_PARAMETER;
+    if (!in_window(physical_address, length, g_vram_bar, g_vram_size))
+        return STATUS_ACCESS_DENIED;
 
-    new VA:va = io_space_map(pa, len);
-    if (va == NULL) return STATUS_INSUFFICIENT_RESOURCES;
-    for (new i = 0; i < SMU_METRICS_DWORDS; i++) {
-        new v = 0;
-        virtual_read_dword(va + i * 4, v);
-        out[i] = v & 0xFFFFFFFF;
+    new VA:virtual_address = io_space_map(physical_address, length);
+    if (virtual_address == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    for (new i = 0; i < SMU14_METRICS_DWORDS; i++) {
+        new value = 0;
+        new NTSTATUS:status = virtual_read_dword(virtual_address + i * 4, value);
+        if (status != STATUS_SUCCESS) {
+            io_space_unmap(virtual_address, length);
+            return status;
+        }
+        out[i] = value & 0xFFFFFFFF;
     }
-    io_space_unmap(va, len);
+    io_space_unmap(virtual_address, length);
     return STATUS_SUCCESS;
 }
 
-/// Report which device the module selected and the apertures it enforces.
-///
-/// Lets the caller confirm the module bound to the same GPU it intends to
-/// drive, and observe the VRAM aperture size across ReBAR states.
+/// Report the selected GPU's register and VRAM apertures.
 ///
 /// @param in Ignored
 /// @param in_size Must be 1
-/// @param out [0] = always 1; the module refuses to load at all when no
-///            supported GPU is found, so a loaded module is a bound one
-///            [1] = register BAR base, [2] = register BAR size
-///            [3] = VRAM aperture base, [4] = VRAM aperture size
+/// @param out [0] = ready; [1]/[2] = register BAR base/size;
+///            [3]/[4] = VRAM BAR base/size
 /// @param out_size Must be 5
 /// @return An NTSTATUS
 DEFINE_IOCTL_SIZED(ioctl_get_bounds, 1, 5) {
@@ -355,25 +428,156 @@ DEFINE_IOCTL_SIZED(ioctl_get_bounds, 1, 5) {
     return STATUS_SUCCESS;
 }
 
-/* --- Lifecycle --- */
+/* ---------------------------------------------------------------------
+ * ABI 2 monitoring IOCTLs
+ * ------------------------------------------------------------------- */
+
+/// Report the selected GPU, apertures, metrics address, and supported sizes.
+///
+/// Address fields are zero when C2PMSG_80/81 do not expose a usable pointer.
+/// Device identity and bounds remain available in that state.
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out [0] = module ABI; [1..7] = PCI identity; [8..11] = register and
+///            VRAM BAR base/size; [12..14] = GPU address, VRAM offset, and host
+///            physical address; [15..18] = RDNA2, RDNA3.0, RDNA3.7, and RDNA4
+///            metrics DWORD counts
+/// @param out_size Must be 19
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_get_device_info, 0, 19) {
+    if (!g_ready)
+        return STATUS_DEVICE_NOT_READY;
+
+    new gpu_address = 0, vram_offset = 0, physical_address = 0;
+    new NTSTATUS:address_status = resolve_metrics_buffer(
+        SMU14_METRICS_DWORDS * 4,
+        gpu_address,
+        vram_offset,
+        physical_address);
+    if (address_status != STATUS_SUCCESS) {
+        gpu_address = 0;
+        vram_offset = 0;
+        physical_address = 0;
+    }
+
+    out[0] = MODULE_ABI_VERSION;
+    out[1] = g_pci_bus;
+    out[2] = g_pci_device;
+    out[3] = g_pci_function;
+    out[4] = g_device_id;
+    out[5] = g_revision_id;
+    out[6] = g_subsystem_vendor_id;
+    out[7] = g_subsystem_device_id;
+    out[8] = g_reg_bar;
+    out[9] = g_reg_size;
+    out[10] = g_vram_bar;
+    out[11] = g_vram_size;
+    out[12] = gpu_address;
+    out[13] = vram_offset;
+    out[14] = physical_address;
+    out[15] = SMU11_METRICS_DWORDS;
+    out[16] = SMU13_0_0_METRICS_DWORDS;
+    out[17] = SMU13_0_7_METRICS_DWORDS;
+    out[18] = SMU14_METRICS_DWORDS;
+    return STATUS_SUCCESS;
+}
+
+/// Resolve the current metrics pointer for diagnostics without reading it.
+///
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out [0] = GPU address; [1] = VRAM offset; [2] = host physical address
+/// @param out_size Must be 3
+/// @return An NTSTATUS; fails while C2PMSG_80/81 expose no usable pointer
+DEFINE_IOCTL_SIZED(ioctl_get_metrics_address, 0, 3) {
+    new NTSTATUS:status = resolve_metrics_buffer(
+        SMU14_METRICS_DWORDS * 4,
+        out[0],
+        out[1],
+        out[2]);
+    return status;
+}
+
+/// Read the current SMU11 (RDNA2) metrics table.
+///
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out 41 raw DWORDs (164 bytes)
+/// @param out_size Must be 41
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_read_metrics_rdna2, 0, SMU11_METRICS_DWORDS) {
+    return read_current_metrics(SMU11_METRICS_DWORDS, out);
+}
+
+/// Read the current SMU13.0.0/13.0.10 (RDNA3) metrics table.
+///
+/// This PR-style name is retained as an alias for ioctl_read_metrics_rdna3_0.
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out 61 raw DWORDs (244 bytes)
+/// @param out_size Must be 61
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_read_metrics_rdna3, 0, SMU13_0_0_METRICS_DWORDS) {
+    return read_current_metrics(SMU13_0_0_METRICS_DWORDS, out);
+}
+
+/// Read the current SMU13.0.0/13.0.10 (RDNA3) metrics table.
+///
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out 61 raw DWORDs (244 bytes)
+/// @param out_size Must be 61
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_read_metrics_rdna3_0, 0, SMU13_0_0_METRICS_DWORDS) {
+    return read_current_metrics(SMU13_0_0_METRICS_DWORDS, out);
+}
+
+/// Read the current SMU13.0.7 (RDNA3) metrics table.
+///
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out 60 raw DWORDs (240 bytes)
+/// @param out_size Must be 60
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_read_metrics_rdna3_7, 0, SMU13_0_7_METRICS_DWORDS) {
+    return read_current_metrics(SMU13_0_7_METRICS_DWORDS, out);
+}
+
+/// Read the current SMU14 (RDNA4) metrics table.
+///
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out 65 raw DWORDs (260 bytes)
+/// @param out_size Must be 65
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_read_metrics_rdna4, 0, SMU14_METRICS_DWORDS) {
+    return read_current_metrics(SMU14_METRICS_DWORDS, out);
+}
+
+/* ---------------------------------------------------------------------
+ * Lifecycle
+ * ------------------------------------------------------------------- */
 
 NTSTATUS:main() {
     if (get_arch() != ARCH_X64)
         return STATUS_NOT_SUPPORTED;
 
     g_ready = 0;
+    g_pci_bus = 0;
+    g_pci_device = 0;
+    g_pci_function = 0;
+    g_device_id = 0;
+    g_revision_id = 0;
+    g_subsystem_vendor_id = 0;
+    g_subsystem_device_id = 0;
     g_reg_bar = 0;
     g_reg_size = 0;
     g_vram_bar = 0;
     g_vram_size = 0;
     find_gpu_and_probe();
 
-    /* Refuse to load rather than loading and denying every ioctl: a
-     * caller on a machine with no supported AMD GPU learns at load time
-     * instead of from a string of STATUS_ACCESS_DENIED results. */
     if (!g_ready)
         return STATUS_NOT_SUPPORTED;
-
     return STATUS_SUCCESS;
 }
 
