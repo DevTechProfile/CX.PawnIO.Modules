@@ -18,53 +18,98 @@
 //  SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * RadeonSMU - bounded SMU metrics access for AMD Radeon RDNA GPUs.
+ * RadeonSMU - SMU mailbox and bounded telemetry access for AMD Radeon RDNA
+ * GPUs.
  *
- * This is an extension of the RadeonSMU module proposed in
- * PawnIO.Modules pull request #110. The legacy IOCTLs remain available for
- * compatibility. ABI 2 adds device identity and fixed-size, read-only metrics
- * calls sized for the public SMU11 (RDNA2), SMU13.0.0/13.0.7 (RDNA3), and
- * SMU14 (RDNA4) layouts. Those calls recover and validate the current table
- * address inside the module when the firmware exposes it through the register
- * pair used by the original Navi 44 implementation; a caller cannot choose a
- * physical address.
+ * Replaces WinRing0/InpOut32-style raw physical MMIO for AMD GPU software.
+ * Rather than handing out an unrestricted physical read/write primitive, this
+ * module owns the SMN index/data sequence and allowlists the SMN addresses a
+ * caller may reach.
+ *
+ * Discovery
+ * ---------
+ * The module finds the AMD display device by PCI scan and reads its own BAR
+ * bases and sizes. Selection is by largest VRAM aperture rather than
+ * enumeration order, so an AMD iGPU that enumerates first cannot shadow a
+ * discrete card. `ioctl_get_device_info` reports the selected PCI identity in
+ * addition to the apertures returned by the legacy `ioctl_get_bounds`.
+ *
+ * Exposed surface
+ * ---------------
+ *   - SMN reads/writes restricted to the MP1 C2PMSG register file
+ *     (0x03B10900..0x03B10AFF, 128 registers).
+ *   - The legacy fixed-size SMU14 metrics read from a caller-supplied address,
+ *     bounded to the selected GPU's VRAM aperture.
+ *   - Fixed-size SMU11, SMU13.0.0, SMU13.0.7, and SMU14 reads that resolve the
+ *     current table address from C2PMSG_80/81 and validate the complete range
+ *     against the same VRAM aperture.
+ *   - No system RAM access, no other device, no framebuffer write, and no SMN
+ *     address outside the mailbox window.
+ *
+ * The generation-specific reads take no address argument, but this is a
+ * convenience rather than an additional security boundary. C2PMSG_80/81 are
+ * inside the writable mailbox allowlist, so a caller can steer the derived
+ * address; the legacy `ioctl_read_metrics` also accepts an address directly.
+ * Every physical read remains bounded to the selected GPU's VRAM aperture.
  *
  * The module deliberately does not send an SMU message to refresh the table.
- * It reads C2PMSG_80/81 and fails closed while no usable address is present.
- * This address-discovery mechanism is not universal: Navi 31 was verified to
- * leave both registers at zero even while AMD telemetry is active.
+ * On the tested Navi 21 (RX 6800 XT) and Navi 31 (RX 7900 XTX), C2PMSG_80/81
+ * stayed zero while driver telemetry was active. Consequently, no raw metrics
+ * table was read on those cards: device discovery and the fail-closed
+ * STATUS_DEVICE_NOT_READY path were validated, while the test application
+ * obtained displayed metrics through its ADL PMLog fallback. The original
+ * pull request author validated a real address and table read on Navi 44.
+ *
+ * Reference
+ * ---------
+ *   - Linux amdgpu `smu_cmn.c` for the mailbox protocol and
+ *     `amdgpu_device.c` for PCIE_INDEX2/PCIE_DATA2 indirect SMN access.
+ *   - `smu11_driver_if_sienna_cichlid.h`,
+ *     `smu13_driver_if_v13_0_0.h`, `smu13_driver_if_v13_0_7.h`, and
+ *     `smu14_driver_if_v14_0.h` for the metrics layouts and sizes.
  */
 
 #include <pawnio.inc>
 
+/// Version of the extended monitoring interface exposed by this module.
 const MODULE_ABI_VERSION = 2;
+/// PCI vendor ID for AMD/ATI.
 const AMD_VENDOR_ID = 0x1002;
 
-/* BAR5 indirect SMN index/data pair. */
+/// BAR5 offset of PCIE_INDEX2, the indirect SMN address register.
 const SMN_INDEX_OFFSET = 0x38;
+/// BAR5 offset of PCIE_DATA2, the indirect SMN data register.
 const SMN_DATA_OFFSET = 0x3C;
 
-/* MP1 C2PMSG register file. */
+/// First SMN address of the MP1 C2PMSG register file (C2PMSG_0).
 const MP1_C2PMSG_BASE = 0x03B10900;
+/// Byte span of the C2PMSG register file: 128 dword registers.
 const MP1_C2PMSG_SPAN = 0x200;
+/// High and low halves of the metrics address used by the Navi 44 protocol.
 const MP1_C2PMSG_80 = MP1_C2PMSG_BASE + 80 * 4;
 const MP1_C2PMSG_81 = MP1_C2PMSG_BASE + 81 * 4;
 
-/* Public SmuMetrics_t core sizes. RDNA2 uses the largest of its four
- * published layouts so a user-mode parser can select Base/V2/V3/V4. */
+/* Public metrics sizes, verified against the Linux amdgpu headers named in
+ * the reference section above. SMU11 has 136-byte Base, 156-byte V2,
+ * 164-byte V3, and 160-byte V4 layouts, so its fixed read uses the largest. */
 const SMU11_METRICS_DWORDS = 41;  /* 164 bytes */
 const SMU13_0_0_METRICS_DWORDS = 61;  /* 244 bytes, Navi 31/32 */
 const SMU13_0_7_METRICS_DWORDS = 60;  /* 240 bytes, Navi 33    */
 const SMU14_METRICS_DWORDS = 65;  /* 260 bytes */
 
-/* Radeon discrete-GPU addresses exposed by this protocol use this VRAM MC base.
- * The derived offset must still fit the selected PCI BAR0 aperture. */
+/* Radeon discrete-GPU addresses exposed by this protocol use this VRAM MC
+ * base. The derived offset must still fit the selected PCI BAR0 aperture. */
 const GPU_VRAM_MC_BASE = 0x8000000000;
 
+/* Fallback register-BAR window, used only if the BAR5 size probe returns an
+ * implausible result. The physical SMN index/data pair must still fit. */
 const REG_SPAN = 0x100000;
+/// Sanity bound on the probed BAR5 size; larger is treated as a bad read.
 const REG_SIZE_MAX = 0x1000000;      /* 16 MB */
+/// Sanity bound on the probed BAR0 size; larger is treated as a bad read.
 const VRAM_SIZE_MAX = 0x1000000000;  /* 64 GB */
 
+/* Selected PCI device and apertures, populated once during module load. */
 new g_ready = 0;
 new g_pci_bus = 0;
 new g_pci_device = 0;
@@ -82,6 +127,8 @@ new g_vram_size = 0;
  * Discovery
  * ------------------------------------------------------------------- */
 
+/// Discover the AMD VGA controller with the largest VRAM aperture, validate
+/// and probe its BARs, record its PCI identity, and set g_ready on success.
 find_gpu_and_probe() {
     new best_bus = -1, best_device = -1;
     new best_vram_bar = 0, best_vram_size = 0;
@@ -208,6 +255,10 @@ find_gpu_and_probe() {
  * Bounds and SMN access
  * ------------------------------------------------------------------- */
 
+/// True iff [address, address + length) lies inside [base, base + size).
+///
+/// This form is overflow-safe for signed 64-bit Pawn cells: it never adds to
+/// address or base before validating the subtraction and remaining length.
 bool:in_window(address, length, base, size) {
     if (size <= 0 || length <= 0)
         return false;
@@ -221,12 +272,14 @@ bool:in_window(address, length, base, size) {
     return true;
 }
 
+/// True iff smn_address is dword-aligned and inside the MP1 C2PMSG file.
 bool:smn_allowed(smn_address) {
     if ((smn_address & 0x3) != 0)
         return false;
     return in_window(smn_address, 4, MP1_C2PMSG_BASE, MP1_C2PMSG_SPAN);
 }
 
+/// Perform one indirect SMN read through BAR5 PCIE_INDEX2/PCIE_DATA2.
 NTSTATUS:smn_read(smn_address, &value) {
     new VA:virtual_address = io_space_map(g_reg_bar + SMN_INDEX_OFFSET, 8);
     if (virtual_address == NULL)
@@ -239,6 +292,7 @@ NTSTATUS:smn_read(smn_address, &value) {
     return status;
 }
 
+/// Perform one indirect SMN write through BAR5 PCIE_INDEX2/PCIE_DATA2.
 NTSTATUS:smn_write(smn_address, value) {
     new VA:virtual_address = io_space_map(g_reg_bar + SMN_INDEX_OFFSET, 8);
     if (virtual_address == NULL)
@@ -251,9 +305,11 @@ NTSTATUS:smn_write(smn_address, value) {
     return status;
 }
 
-/* Resolve the current metrics pointer exposed through the Navi 44 register
- * protocol and translate it into the selected BAR0 aperture. Reading
- * high/low/high rejects a torn register pair. */
+/// Resolve the current metrics pointer exposed through the Navi 44 register
+/// protocol and translate it into the selected BAR0 aperture.
+///
+/// Reading high/low/high rejects a torn register pair. The resulting range is
+/// checked both as a VRAM offset and as a translated host physical address.
 NTSTATUS:resolve_metrics_buffer(length, &gpu_address, &vram_offset, &physical_address) {
     gpu_address = 0;
     vram_offset = 0;
@@ -300,6 +356,7 @@ NTSTATUS:resolve_metrics_buffer(length, &gpu_address, &vram_offset, &physical_ad
     return STATUS_SUCCESS;
 }
 
+/// Resolve, map, and copy a fixed-size current metrics table.
 NTSTATUS:read_current_metrics(dword_count, result[]) {
     new gpu_address = 0, vram_offset = 0, physical_address = 0;
     new length = dword_count * 4;
@@ -335,7 +392,9 @@ NTSTATUS:read_current_metrics(dword_count, result[]) {
 
 /// Read one dword from the SMU message mailbox.
 ///
-/// @param in [0] = dword-aligned SMN address inside the MP1 C2PMSG file
+/// @param in [0] = SMN address. Must be dword-aligned and inside the MP1
+///           C2PMSG register file (0x03B10900..0x03B10AFF); any other
+///           address returns STATUS_ACCESS_DENIED.
 /// @param in_size Must be 1
 /// @param out [0] = register value, zero-extended to 64 bits
 /// @param out_size Must be 1
@@ -355,8 +414,13 @@ DEFINE_IOCTL_SIZED(ioctl_read_smn, 1, 1) {
 
 /// Write one dword to the SMU message mailbox.
 ///
-/// @param in [0] = dword-aligned SMN address inside the MP1 C2PMSG file;
-///           [1] = value to write, with only the low 32 bits used
+/// Writing an ID to C2PMSG_66 issues a PPSMC message. The module deliberately
+/// gates addresses rather than message IDs, matching the RyzenSMU approach.
+///
+/// @param in [0] = SMN address. Must be dword-aligned and inside the MP1
+///           C2PMSG register file (0x03B10900..0x03B10AFF); any other
+///           address returns STATUS_ACCESS_DENIED.
+///           [1] = value to write; only the low 32 bits are used.
 /// @param in_size Must be 2
 /// @param out [0] = status of the underlying register write
 /// @param out_size Must be 1
@@ -375,7 +439,7 @@ DEFINE_IOCTL_SIZED(ioctl_write_smn, 2, 1) {
     return status;
 }
 
-/// Read one SMU14-sized metrics table from a caller-selected address.
+/// Read the SMU14-sized metrics buffer at a caller-selected VRAM address.
 ///
 /// @deprecated Use a generation-specific metrics ioctl, which resolves the
 ///             address inside the module.
@@ -411,8 +475,10 @@ DEFINE_IOCTL_SIZED(ioctl_read_metrics, 1, SMU14_METRICS_DWORDS) {
     return STATUS_SUCCESS;
 }
 
-/// Report the selected GPU's register and VRAM apertures.
+/// Report which GPU apertures the module selected and enforces.
 ///
+/// The module refuses to load when discovery fails, so ready is one for a
+/// successfully loaded instance.
 /// @param in Ignored
 /// @param in_size Must be 1
 /// @param out [0] = ready; [1]/[2] = register BAR base/size;
@@ -509,19 +575,7 @@ DEFINE_IOCTL_SIZED(ioctl_read_metrics_rdna2, 0, SMU11_METRICS_DWORDS) {
     return read_current_metrics(SMU11_METRICS_DWORDS, out);
 }
 
-/// Read the current SMU13.0.0/13.0.10 (RDNA3) metrics table.
-///
-/// This PR-style name is retained as an alias for ioctl_read_metrics_rdna3_0.
-/// @param in Ignored
-/// @param in_size Must be 0
-/// @param out 61 raw DWORDs (244 bytes)
-/// @param out_size Must be 61
-/// @return An NTSTATUS
-DEFINE_IOCTL_SIZED(ioctl_read_metrics_rdna3, 0, SMU13_0_0_METRICS_DWORDS) {
-    return read_current_metrics(SMU13_0_0_METRICS_DWORDS, out);
-}
-
-/// Read the current SMU13.0.0/13.0.10 (RDNA3) metrics table.
+/// Read the current SMU13.0.0-layout (RDNA3) metrics table.
 ///
 /// @param in Ignored
 /// @param in_size Must be 0
