@@ -43,6 +43,11 @@
  *   - Fixed-size SMU11, SMU13.0.0, SMU13.0.7, and SMU14 reads that resolve the
  *     current table address from C2PMSG_80/81 and validate the complete range
  *     against the same VRAM aperture.
+ *   - A fixed private monitoring-table transaction for allowlisted RDNA2,
+ *     RDNA3, and RDNA4 device families. The module selects the mailbox
+ *     commands, validates the firmware-reported address against both the
+ *     framebuffer interval and BAR0, and returns one 8-KiB snapshot.
+ *   - Four fixed Navi 21 SVI telemetry registers.
  *   - No system RAM access, no other device, no framebuffer write, and no SMN
  *     address outside the mailbox window.
  *
@@ -52,13 +57,13 @@
  * address; the legacy `ioctl_read_metrics` also accepts an address directly.
  * Every physical read remains bounded to the selected GPU's VRAM aperture.
  *
- * The module deliberately does not send an SMU message to refresh the table.
- * On the tested Navi 21 (RX 6800 XT) and Navi 31 (RX 7900 XTX), C2PMSG_80/81
- * stayed zero while driver telemetry was active. Consequently, no raw metrics
- * table was read on those cards: device discovery and the fail-closed
- * STATUS_DEVICE_NOT_READY path were validated, while the test application
- * obtained displayed metrics through its ADL PMLog fallback. The original
- * pull request author validated a real address and table read on Navi 44.
+ * On tested Navi 21 and Navi 31 hardware, C2PMSG_80/81 stayed zero while
+ * driver telemetry was active. The fixed private path is therefore separate
+ * from the public metrics-pointer path. It exposes no caller-selected message,
+ * register, selector, or physical address. Navi 21, Navi 31, and Navi 48
+ * private tables were validated with versions 0x003A0010, 0x004E000C, and
+ * 0x00660006 respectively. The original pull request author validated the
+ * public pointer path on Navi 44.
  *
  * Reference
  * ---------
@@ -72,7 +77,7 @@
 #include <pawnio.inc>
 
 /// Version of the extended monitoring interface exposed by this module.
-const MODULE_ABI_VERSION = 2;
+const MODULE_ABI_VERSION = 5;
 /// PCI vendor ID for AMD/ATI.
 const AMD_VENDOR_ID = 0x1002;
 
@@ -80,6 +85,57 @@ const AMD_VENDOR_ID = 0x1002;
 const SMN_INDEX_OFFSET = 0x38;
 /// BAR5 offset of PCIE_DATA2, the indirect SMN data register.
 const SMN_DATA_OFFSET = 0x3C;
+
+/// Navi 21 PCI device range accepted by the private table and SVI reads.
+const NAVI21_DEVICE_ID_MIN = 0x73A0;
+const NAVI21_DEVICE_ID_MAX = 0x73BF;
+/// BAR5 offset and size of the fixed Navi 21 SVI telemetry range.
+const NAVI21_SVI_OFFSET = 0x5A00C;
+const NAVI21_SVI_DWORDS = 4;
+
+/// RDNA3 PCI device ranges accepted by the private table read.
+const RDNA3_DEVICE_ID_MIN_0 = 0x7440;
+const RDNA3_DEVICE_ID_MAX_0 = 0x746F;
+const RDNA3_DEVICE_ID_MIN_1 = 0x7470;
+const RDNA3_DEVICE_ID_MAX_1 = 0x749F;
+
+/// RDNA4 PCI device ranges accepted by the private table read.
+const RDNA4_DEVICE_ID_MIN_0 = 0x7550;
+const RDNA4_DEVICE_ID_MAX_0 = 0x756F;
+const RDNA4_DEVICE_ID_MIN_1 = 0x7590;
+const RDNA4_DEVICE_ID_MAX_1 = 0x75AF;
+
+/* Fixed private-tool mailbox registers, commands, and responses. */
+const RDNA_TOOL_MESSAGE_OFFSET = 0x58A20;   /* C2PMSG_72  */
+const RDNA_TOOL_RESPONSE_OFFSET = 0x58A80;  /* C2PMSG_96  */
+const RDNA_TOOL_ARGUMENT_OFFSET = 0x58A88;  /* C2PMSG_98  */
+const RDNA_TOOL_ARG_V10_OFFSET = 0x58AB4;   /* C2PMSG_109 */
+const RDNA_TOOL_GET_VERSION = 0x14;
+const RDNA_TOOL_GET_ADDRESS_HIGH = 0x07;
+const RDNA_TOOL_GET_ADDRESS_LOW = 0x08;
+const RDNA_TOOL_REFRESH_TABLE = 0x09;
+const RDNA_TOOL_REFRESH_SELECTOR = 4;
+const RDNA_TOOL_RESPONSE_OK = 1;
+const RDNA_TOOL_RESPONSE_BUSY = 0xFC;
+const RDNA_TOOL_RSP_PREREQ = 0xFD;
+const RDNA_TOOL_RESPONSE_UNKNOWN = 0xFE;
+const RDNA_TOOL_POLL_ATTEMPTS = 10000;
+const RDNA_TOOL_POLL_DELAY_US = 100;
+const RDNA_TOOL_READ_ATTEMPTS = 5;
+const RDNA_TOOL_READ_RETRY_DELAY_US = 10000;
+
+/* Framebuffer bounds. Navi 21 device 73BF/D5 uses the alternate pair. */
+const NAVI21_FB_BASE_OFFSET = 0xE54C;
+const NAVI21_FB_TOP_OFFSET = 0xE550;
+const RDNA3_FB_BASE_OFFSET = 0xE4D4;
+const RDNA3_FB_TOP_OFFSET = 0xE4D8;
+/// Covers all fixed registers and fits RDNA4's 512-KiB BAR5.
+const RDNA_TOOL_MMIO_MAP_SIZE = 0x80000;
+const RDNA_TOOL_TABLE_BYTES = 0x2000;
+const RDNA_TOOL_TABLE_QWORDS = RDNA_TOOL_TABLE_BYTES / 8;
+const RDNA_TOOL_METADATA_QWORDS = 4;
+const RDNA_TOOL_OUTPUT_QWORDS =
+    RDNA_TOOL_METADATA_QWORDS + RDNA_TOOL_TABLE_QWORDS;
 
 /// First SMN address of the MP1 C2PMSG register file (C2PMSG_0).
 const MP1_C2PMSG_BASE = 0x03B10900;
@@ -96,6 +152,10 @@ const SMU11_METRICS_DWORDS = 41;  /* 164 bytes */
 const SMU13_0_0_METRICS_DWORDS = 61;  /* 244 bytes, Navi 31/32 */
 const SMU13_0_7_METRICS_DWORDS = 60;  /* 240 bytes, Navi 33    */
 const SMU14_METRICS_DWORDS = 65;  /* 260 bytes */
+
+/// Retry budget for acquiring two equal complete metrics-pointer snapshots.
+const METRICS_ADDRESS_READ_ATTEMPTS = 5;
+const METRICS_ADDRESS_RETRY_DELAY_US = 10000;
 
 /* Radeon discrete-GPU addresses exposed by this protocol use this VRAM MC
  * base. The derived offset must still fit the selected PCI BAR0 aperture. */
@@ -305,11 +365,374 @@ NTSTATUS:smn_write(smn_address, value) {
     return status;
 }
 
+/// True iff device_id belongs to an allowlisted RDNA3 family.
+bool:is_rdna3_tool_device(device_id) {
+    return ((device_id >= RDNA3_DEVICE_ID_MIN_0 && device_id <= RDNA3_DEVICE_ID_MAX_0) ||
+            (device_id >= RDNA3_DEVICE_ID_MIN_1 && device_id <= RDNA3_DEVICE_ID_MAX_1));
+}
+
+/// True iff device_id belongs to an allowlisted RDNA4 family.
+bool:is_rdna4_tool_device(device_id) {
+    return ((device_id >= RDNA4_DEVICE_ID_MIN_0 && device_id <= RDNA4_DEVICE_ID_MAX_0) ||
+            (device_id >= RDNA4_DEVICE_ID_MIN_1 && device_id <= RDNA4_DEVICE_ID_MAX_1));
+}
+
+/// True iff device_id may use the fixed private monitoring-table protocol.
+bool:is_rdna_tool_device(device_id) {
+    return ((device_id >= NAVI21_DEVICE_ID_MIN && device_id <= NAVI21_DEVICE_ID_MAX) ||
+            is_rdna3_tool_device(device_id) ||
+            is_rdna4_tool_device(device_id));
+}
+
+/// Map a firmware table version to its known mailbox layout.
+rdna_tool_layout(version) {
+    switch ((version >>> 16) & 0xFFFF) {
+        case 0x0000: return 1;
+        case 0x0027: return 2;
+        case 0x0028: return 3;
+        case 0x0029: return 4;
+        case 0x0034: return 5;
+        case 0x003A: return 6;
+        case 0x004E: return 7;
+        case 0x0066: return 8;
+        case 0x0044: return 9;
+        case 0x0055: return 10;
+        case 0x0056: return 11;
+    }
+    return 0;
+}
+
+/// Translate a private mailbox response into an NTSTATUS.
+NTSTATUS:rdna_tool_response_status(response) {
+    response = response & 0xFFFFFFFF;
+    if (response == RDNA_TOOL_RESPONSE_OK)
+        return STATUS_SUCCESS;
+    if (response == RDNA_TOOL_RESPONSE_BUSY)
+        return STATUS_DEVICE_BUSY;
+    if (response == RDNA_TOOL_RSP_PREREQ)
+        return STATUS_INVALID_DEVICE_STATE;
+    if (response == RDNA_TOOL_RESPONSE_UNKNOWN)
+        return STATUS_NOT_SUPPORTED;
+    return STATUS_UNSUCCESSFUL;
+}
+
+/// Wait until the private mailbox response register becomes nonzero.
+NTSTATUS:rdna_tool_wait_response(VA:registers, &response) {
+    response = 0;
+    for (new attempt = 0; attempt < RDNA_TOOL_POLL_ATTEMPTS; attempt++) {
+        new NTSTATUS:status = virtual_read_dword(
+            registers + RDNA_TOOL_RESPONSE_OFFSET,
+            response);
+        if (status != STATUS_SUCCESS)
+            return status;
+        if ((response & 0xFFFFFFFF) != 0)
+            return STATUS_SUCCESS;
+
+        status = microsleep(RDNA_TOOL_POLL_DELAY_US);
+        if (status != STATUS_SUCCESS)
+            return status;
+    }
+    return STATUS_IO_TIMEOUT;
+}
+
+/// Send one fixed private mailbox command and return its argument register.
+NTSTATUS:rdna_tool_send(
+    VA:registers,
+    argument_offset,
+    message,
+    bool:has_argument,
+    &argument) {
+    new response = 0;
+    new NTSTATUS:status = rdna_tool_wait_response(registers, response);
+    if (status != STATUS_SUCCESS)
+        return status;
+
+    status = virtual_write_dword(registers + RDNA_TOOL_RESPONSE_OFFSET, 0);
+    if (status != STATUS_SUCCESS)
+        return status;
+
+    if (has_argument) {
+        status = virtual_write_dword(
+            registers + argument_offset,
+            argument & 0xFFFFFFFF);
+        if (status != STATUS_SUCCESS)
+            return status;
+    }
+
+    status = virtual_write_dword(
+        registers + RDNA_TOOL_MESSAGE_OFFSET,
+        message & 0xFFFFFFFF);
+    if (status != STATUS_SUCCESS)
+        return status;
+
+    status = rdna_tool_wait_response(registers, response);
+    if (status != STATUS_SUCCESS)
+        return status;
+
+    status = rdna_tool_response_status(response);
+    if (status != STATUS_SUCCESS)
+        return status;
+
+    status = virtual_read_dword(registers + argument_offset, argument);
+    if (status != STATUS_SUCCESS)
+        return status;
+    argument = argument & 0xFFFFFFFF;
+    return STATUS_SUCCESS;
+}
+
+/// Read the generation-specific framebuffer interval from fixed BAR5 offsets.
+NTSTATUS:rdna_tool_framebuffer_bounds(VA:registers, &fb_base, &fb_top) {
+    new base_offset = NAVI21_FB_BASE_OFFSET;
+    new top_offset = NAVI21_FB_TOP_OFFSET;
+    if (is_rdna3_tool_device(g_device_id) ||
+        is_rdna4_tool_device(g_device_id) ||
+        (g_device_id == 0x73BF && g_revision_id == 0xD5)) {
+        base_offset = RDNA3_FB_BASE_OFFSET;
+        top_offset = RDNA3_FB_TOP_OFFSET;
+    }
+
+    new base_value = 0, top_value = 0;
+    new NTSTATUS:status = virtual_read_dword(registers + base_offset, base_value);
+    if (status != STATUS_SUCCESS)
+        return status;
+    status = virtual_read_dword(registers + top_offset, top_value);
+    if (status != STATUS_SUCCESS)
+        return status;
+
+    fb_base = (base_value & 0x00FFFFFF) << 24;
+    fb_top = (top_value & 0x00FFFFFF) << 24;
+    if (fb_top <= fb_base)
+        return STATUS_INVALID_ADDRESS;
+    return STATUS_SUCCESS;
+}
+
+/// Query, refresh, validate, and copy one private monitoring-table snapshot.
+NTSTATUS:read_rdna_tool_table(result[]) {
+    if (!g_ready)
+        return STATUS_DEVICE_NOT_READY;
+    if (!is_rdna_tool_device(g_device_id))
+        return STATUS_NOT_SUPPORTED;
+    if (!in_window(0, RDNA_TOOL_MMIO_MAP_SIZE, 0, g_reg_size))
+        return STATUS_NOT_SUPPORTED;
+
+    new VA:registers = io_space_map(g_reg_bar, RDNA_TOOL_MMIO_MAP_SIZE);
+    if (registers == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    new version = 0;
+    new NTSTATUS:status = rdna_tool_send(
+        registers,
+        RDNA_TOOL_ARGUMENT_OFFSET,
+        RDNA_TOOL_GET_VERSION,
+        false,
+        version);
+    if (status != STATUS_SUCCESS) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return status;
+    }
+
+    new layout = rdna_tool_layout(version);
+    if (layout == 0) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return STATUS_NOT_SUPPORTED;
+    }
+    new argument_offset = layout == 10
+        ? RDNA_TOOL_ARG_V10_OFFSET
+        : RDNA_TOOL_ARGUMENT_OFFSET;
+
+    new address_high = 0;
+    status = rdna_tool_send(
+        registers,
+        argument_offset,
+        RDNA_TOOL_GET_ADDRESS_HIGH,
+        false,
+        address_high);
+    if (status != STATUS_SUCCESS) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return status;
+    }
+
+    new address_low = 0;
+    status = rdna_tool_send(
+        registers,
+        argument_offset,
+        RDNA_TOOL_GET_ADDRESS_LOW,
+        false,
+        address_low);
+    if (status != STATUS_SUCCESS) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return status;
+    }
+
+    new gpu_address =
+        ((address_high & 0xFFFFFFFF) << 32) | (address_low & 0xFFFFFFFF);
+    if ((gpu_address & 0x3) != 0) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    new fb_base = 0, fb_top = 0;
+    status = rdna_tool_framebuffer_bounds(registers, fb_base, fb_top);
+    if (status != STATUS_SUCCESS) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return status;
+    }
+    if (!in_window(
+            gpu_address,
+            RDNA_TOOL_TABLE_BYTES,
+            fb_base,
+            fb_top - fb_base)) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    new vram_offset = gpu_address - fb_base;
+    if (!in_window(vram_offset, RDNA_TOOL_TABLE_BYTES, 0, g_vram_size)) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return STATUS_ACCESS_DENIED;
+    }
+    new physical_address = g_vram_bar + vram_offset;
+    if (!in_window(
+            physical_address,
+            RDNA_TOOL_TABLE_BYTES,
+            g_vram_bar,
+            g_vram_size)) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    new VA:table = io_space_map(physical_address, RDNA_TOOL_TABLE_BYTES);
+    if (table == NULL) {
+        io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    new bool:valid_table = false;
+    for (new attempt = 0; attempt < RDNA_TOOL_READ_ATTEMPTS; attempt++) {
+        new refresh_argument = RDNA_TOOL_REFRESH_SELECTOR;
+        status = rdna_tool_send(
+            registers,
+            argument_offset,
+            RDNA_TOOL_REFRESH_TABLE,
+            true,
+            refresh_argument);
+        if (status != STATUS_SUCCESS) {
+            io_space_unmap(table, RDNA_TOOL_TABLE_BYTES);
+            io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+            return status;
+        }
+
+        new first_qword = 0;
+        new bool:all_same = true;
+        for (new i = 0; i < RDNA_TOOL_TABLE_QWORDS; i++) {
+            new data_low = 0, data_high = 0;
+            status = virtual_read_dword(table + i * 8, data_low);
+            if (status == STATUS_SUCCESS)
+                status = virtual_read_dword(table + i * 8 + 4, data_high);
+            if (status != STATUS_SUCCESS) {
+                io_space_unmap(table, RDNA_TOOL_TABLE_BYTES);
+                io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+                return status;
+            }
+
+            new data =
+                (data_low & 0xFFFFFFFF) | ((data_high & 0xFFFFFFFF) << 32);
+            result[RDNA_TOOL_METADATA_QWORDS + i] = data;
+            if (i == 0)
+                first_qword = data;
+            else if (data != first_qword)
+                all_same = false;
+        }
+
+        if (!all_same) {
+            valid_table = true;
+            break;
+        }
+
+        if (attempt + 1 < RDNA_TOOL_READ_ATTEMPTS) {
+            status = microsleep(RDNA_TOOL_READ_RETRY_DELAY_US);
+            if (status != STATUS_SUCCESS) {
+                io_space_unmap(table, RDNA_TOOL_TABLE_BYTES);
+                io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+                return status;
+            }
+        }
+    }
+    io_space_unmap(table, RDNA_TOOL_TABLE_BYTES);
+    io_space_unmap(registers, RDNA_TOOL_MMIO_MAP_SIZE);
+
+    if (!valid_table)
+        return STATUS_DATA_ERROR;
+
+    result[0] = version & 0xFFFFFFFF;
+    result[1] = gpu_address;
+    result[2] = fb_base;
+    result[3] = fb_top;
+    return STATUS_SUCCESS;
+}
+
+/// Preserve the Navi 21-only entry point introduced by ABI 3.
+NTSTATUS:read_navi21_tool_table(result[]) {
+    if (g_device_id < NAVI21_DEVICE_ID_MIN || g_device_id > NAVI21_DEVICE_ID_MAX)
+        return STATUS_NOT_SUPPORTED;
+    return read_rdna_tool_table(result);
+}
+
+/// Read four fixed Navi 21 SVI telemetry dwords from BAR5.
+NTSTATUS:read_navi21_svi(result[]) {
+    new length = NAVI21_SVI_DWORDS * 4;
+    if (!g_ready)
+        return STATUS_DEVICE_NOT_READY;
+    if (g_device_id < NAVI21_DEVICE_ID_MIN || g_device_id > NAVI21_DEVICE_ID_MAX)
+        return STATUS_NOT_SUPPORTED;
+    if (!in_window(NAVI21_SVI_OFFSET, length, 0, g_reg_size))
+        return STATUS_NOT_SUPPORTED;
+
+    new VA:virtual_address = io_space_map(g_reg_bar + NAVI21_SVI_OFFSET, length);
+    if (virtual_address == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    for (new i = 0; i < NAVI21_SVI_DWORDS; i++) {
+        new value = 0;
+        new NTSTATUS:status = virtual_read_dword(virtual_address + i * 4, value);
+        if (status != STATUS_SUCCESS) {
+            io_space_unmap(virtual_address, length);
+            return status;
+        }
+        result[i] = value & 0xFFFFFFFF;
+    }
+
+    io_space_unmap(virtual_address, length);
+    return STATUS_SUCCESS;
+}
+
+/// Read one metrics-pointer candidate whose high half is internally stable.
+NTSTATUS:read_metrics_pointer_candidate(&address) {
+    address = 0;
+
+    new high_before = 0, high_after = 0, low = 0;
+    new NTSTATUS:status = smn_read(MP1_C2PMSG_80, high_before);
+    if (status != STATUS_SUCCESS)
+        return status;
+    status = smn_read(MP1_C2PMSG_81, low);
+    if (status != STATUS_SUCCESS)
+        return status;
+    status = smn_read(MP1_C2PMSG_80, high_after);
+    if (status != STATUS_SUCCESS)
+        return status;
+    if ((high_before & 0xFFFFFFFF) != (high_after & 0xFFFFFFFF))
+        return STATUS_RETRY;
+
+    address = ((high_before & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF);
+    return STATUS_SUCCESS;
+}
+
 /// Resolve the current metrics pointer exposed through the Navi 44 register
 /// protocol and translate it into the selected BAR0 aperture.
 ///
-/// Reading high/low/high rejects a torn register pair. The resulting range is
-/// checked both as a VRAM offset and as a translated host physical address.
+/// Two equal high/low/high snapshots reject torn or changing register pairs.
+/// The resulting range is checked both as a VRAM offset and as a translated
+/// host physical address.
 NTSTATUS:resolve_metrics_buffer(length, &gpu_address, &vram_offset, &physical_address) {
     gpu_address = 0;
     vram_offset = 0;
@@ -320,40 +743,52 @@ NTSTATUS:resolve_metrics_buffer(length, &gpu_address, &vram_offset, &physical_ad
     if (length <= 0 || length > SMU14_METRICS_DWORDS * 4)
         return STATUS_INVALID_PARAMETER;
 
-    new high_before = 0, high_after = 0, low = 0;
-    new bool:stable = false;
-    for (new attempt = 0; attempt < 4; attempt++) {
-        new NTSTATUS:status = smn_read(MP1_C2PMSG_80, high_before);
-        if (status != STATUS_SUCCESS)
+    new NTSTATUS:last_status = STATUS_RETRY;
+    for (new attempt = 0; attempt < METRICS_ADDRESS_READ_ATTEMPTS; attempt++) {
+        new first_address = 0, second_address = 0;
+        new NTSTATUS:status = read_metrics_pointer_candidate(first_address);
+        if (status != STATUS_SUCCESS && status != STATUS_RETRY)
             return status;
-        status = smn_read(MP1_C2PMSG_81, low);
-        if (status != STATUS_SUCCESS)
+
+        if (status == STATUS_SUCCESS)
+            status = read_metrics_pointer_candidate(second_address);
+        if (status != STATUS_SUCCESS && status != STATUS_RETRY)
             return status;
-        status = smn_read(MP1_C2PMSG_80, high_after);
-        if (status != STATUS_SUCCESS)
-            return status;
-        if ((high_before & 0xFFFFFFFF) == (high_after & 0xFFFFFFFF)) {
-            stable = true;
-            break;
+
+        if (status == STATUS_SUCCESS && first_address == second_address) {
+            if ((first_address & 0x3) != 0) {
+                last_status = STATUS_INVALID_ADDRESS;
+            } else if (first_address < GPU_VRAM_MC_BASE) {
+                last_status = STATUS_DEVICE_NOT_READY;
+            } else {
+                new candidate_offset = first_address - GPU_VRAM_MC_BASE;
+                new candidate_physical = g_vram_bar + candidate_offset;
+                if (!in_window(candidate_offset, length, 0, g_vram_size) ||
+                    !in_window(
+                        candidate_physical,
+                        length,
+                        g_vram_bar,
+                        g_vram_size)) {
+                    last_status = STATUS_ACCESS_DENIED;
+                } else {
+                    gpu_address = first_address;
+                    vram_offset = candidate_offset;
+                    physical_address = candidate_physical;
+                    return STATUS_SUCCESS;
+                }
+            }
+        } else {
+            last_status = STATUS_RETRY;
+        }
+
+        if (attempt + 1 < METRICS_ADDRESS_READ_ATTEMPTS) {
+            status = microsleep(METRICS_ADDRESS_RETRY_DELAY_US);
+            if (status != STATUS_SUCCESS)
+                return status;
         }
     }
-    if (!stable)
-        return STATUS_RETRY;
 
-    gpu_address = ((high_before & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF);
-    if ((gpu_address & 0x3) != 0)
-        return STATUS_INVALID_ADDRESS;
-    if (gpu_address < GPU_VRAM_MC_BASE)
-        return STATUS_DEVICE_NOT_READY;
-
-    vram_offset = gpu_address - GPU_VRAM_MC_BASE;
-    if (!in_window(vram_offset, length, 0, g_vram_size))
-        return STATUS_ACCESS_DENIED;
-
-    physical_address = g_vram_bar + vram_offset;
-    if (!in_window(physical_address, length, g_vram_bar, g_vram_size))
-        return STATUS_ACCESS_DENIED;
-    return STATUS_SUCCESS;
+    return last_status;
 }
 
 /// Resolve, map, and copy a fixed-size current metrics table.
@@ -495,7 +930,7 @@ DEFINE_IOCTL_SIZED(ioctl_get_bounds, 1, 5) {
 }
 
 /* ---------------------------------------------------------------------
- * ABI 2 monitoring IOCTLs
+ * ABI 5 monitoring IOCTLs
  * ------------------------------------------------------------------- */
 
 /// Report the selected GPU, apertures, metrics address, and supported sizes.
@@ -507,10 +942,11 @@ DEFINE_IOCTL_SIZED(ioctl_get_bounds, 1, 5) {
 /// @param out [0] = module ABI; [1..7] = PCI identity; [8..11] = register and
 ///            VRAM BAR base/size; [12..14] = GPU address, VRAM offset, and host
 ///            physical address; [15..18] = RDNA2, RDNA3.0, RDNA3.7, and RDNA4
-///            metrics DWORD counts
-/// @param out_size Must be 19
+///            public metrics DWORD counts; [19] = Navi 21 SVI DWORD count;
+///            [20] = private monitoring-table QWORD count, excluding metadata
+/// @param out_size Must be 21
 /// @return An NTSTATUS
-DEFINE_IOCTL_SIZED(ioctl_get_device_info, 0, 19) {
+DEFINE_IOCTL_SIZED(ioctl_get_device_info, 0, 21) {
     if (!g_ready)
         return STATUS_DEVICE_NOT_READY;
 
@@ -545,6 +981,8 @@ DEFINE_IOCTL_SIZED(ioctl_get_device_info, 0, 19) {
     out[16] = SMU13_0_0_METRICS_DWORDS;
     out[17] = SMU13_0_7_METRICS_DWORDS;
     out[18] = SMU14_METRICS_DWORDS;
+    out[19] = NAVI21_SVI_DWORDS;
+    out[20] = RDNA_TOOL_TABLE_QWORDS;
     return STATUS_SUCCESS;
 }
 
@@ -562,6 +1000,49 @@ DEFINE_IOCTL_SIZED(ioctl_get_metrics_address, 0, 3) {
         out[1],
         out[2]);
     return status;
+}
+
+/// Read the fixed Navi 21 SVI telemetry range.
+///
+/// This entry point accepts only Navi 21 PCI device IDs. It performs no
+/// mailbox or I2C transaction.
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out Four raw DWORDs from BAR5 offset 0x5A00C
+/// @param out_size Must be 4
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_read_navi21_svi, 0, NAVI21_SVI_DWORDS) {
+    return read_navi21_svi(out);
+}
+
+/// Refresh and read the private Navi 21 monitoring table.
+///
+/// This ABI-3 compatibility entry point accepts only Navi 21 PCI device IDs.
+/// Firmware selects the address; the complete range is validated before use.
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out [0] = table version; [1] = GPU address; [2]/[3] = framebuffer
+///            base/top; [4..1027] = 8192 raw table bytes as 1024 QWORDs
+/// @param out_size Must be 1028
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_read_navi21_tool_table, 0, RDNA_TOOL_OUTPUT_QWORDS) {
+    return read_navi21_tool_table(out);
+}
+
+/// Refresh and read the private RDNA2, RDNA3, or RDNA4 monitoring table.
+///
+/// Device IDs, messages, arguments, register offsets, and read size are fixed
+/// by the module. Firmware selects the address; the complete range is checked
+/// against both the GPU framebuffer interval and the selected BAR0 aperture.
+/// Unknown devices and table-layout families fail closed.
+/// @param in Ignored
+/// @param in_size Must be 0
+/// @param out [0] = table version; [1] = GPU address; [2]/[3] = framebuffer
+///            base/top; [4..1027] = 8192 raw table bytes as 1024 QWORDs
+/// @param out_size Must be 1028
+/// @return An NTSTATUS
+DEFINE_IOCTL_SIZED(ioctl_read_rdna_tool_table, 0, RDNA_TOOL_OUTPUT_QWORDS) {
+    return read_rdna_tool_table(out);
 }
 
 /// Read the current SMU11 (RDNA2) metrics table.
